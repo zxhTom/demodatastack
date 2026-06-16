@@ -81,11 +81,18 @@ compress_after  = 7 days
 
 ### 1.2 执行转换
 
+脚本有两种模式，用 `--new-table` 控制：
+
+| `--new-table` | 行为 | 原表 |
+| --- | --- | --- |
+| `yes`（默认） | 新建一张 `<原表名>_ts` 超表，拷贝原表结构和数据 | **保留不变**，可两表并排对比 |
+| `no` | **原地把原表本身转成超表**（数据随之迁移） | 被替换；**替换前自动把原表建表 SQL 备份到 `backups/`** |
+
 ```bash
 # 先 dry-run 看看会执行哪些 SQL（不连库、不改数据）
 python3 convert_to_timescale.py tables.example.ini --dry-run
 
-# 确认无误后真正执行（原表 sensor_data 保留，新建超表 sensor_data_ts）
+# 【默认 / 新建模式】真正执行（原表 sensor_data 保留，新建超表 sensor_data_ts）
 python3 convert_to_timescale.py my_tables.ini
 
 # 换个后缀，比如 _hyper -> sensor_data_hyper
@@ -94,9 +101,21 @@ python3 convert_to_timescale.py my_tables.ini --suffix _hyper
 # 后缀表已存在时先删后建（默认会因为表已存在而报错跳过）
 python3 convert_to_timescale.py my_tables.ini --drop-existing
 
+# 【替换模式】原地把原表转成超表，替换前先把原表建表 SQL 备份到 backups/
+python3 convert_to_timescale.py my_tables.ini --new-table no
+
+# 替换模式自定义备份目录
+python3 convert_to_timescale.py my_tables.ini --new-table no --backup-dir /path/to/backups
+
 # 看每条执行的 SQL
 python3 convert_to_timescale.py my_tables.ini -v
 ```
+
+> 🛡️ **替换模式的安全网**：`--new-table no` 在替换每张表之前，会先从系统目录重建该表的
+> 建表 SQL（列定义 + 约束 + 索引），写到 `backups/<表名>_<时间戳>.sql`（默认目录为项目根
+> 的 `backups/`，可用 `--backup-dir` 改）。**备份失败则跳过该表、不做替换**。原地转换走
+> `create_hypertable(..., migrate_data => true)`，若原表存在不含时间列的主键/唯一约束会失败，
+> 此时该表事务回滚、保持原样（备份文件仍保留）。
 
 脚本对每张表依次执行：按原表结构 `CREATE TABLE <原表名>_ts (LIKE ...)` 新建空表
 → `create_hypertable` 把它变超表 →（可选）`add_dimension` 空间分区
