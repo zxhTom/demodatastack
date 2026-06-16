@@ -148,16 +148,39 @@ python3 benchmark.py --mode both --rows 2000000 --runs 5 --out report.md
 | `--mode {query,insert,both}` | `query` | 测试类型，**默认只测查询** |
 | `--rows N` | `1000000` | 灌入的数据行数 |
 | `--runs N` | `3` | 每个查询重复次数取平均 |
-| `--chunk-interval STR` | `1 day` | 超表 chunk 区间 |
-| `--segmentby COL` | `device_id` | 压缩分段列；传 `''` 则不开压缩（也就不出压缩比） |
+| `--chunk-interval STR` | `1 day` | 超表 chunk 区间（仅自建模式） |
+| `--segmentby COL` | `device_id` | 压缩分段列；传 `''` 则不开压缩（也就不出压缩比，仅自建模式） |
+| `--plain-table NAME` | — | 指定**已有**的普通表名（须与 `--hyper-table` 同时给出） |
+| `--hyper-table NAME` | — | 指定**已有**的超表名（须与 `--plain-table` 同时给出） |
 | `--out PATH` | `benchmark_report.md` | 报告输出路径 |
 | `--env-file PATH` | 同目录 `db.env` | 指定连接配置文件 |
-| `--keep` | 否 | 结束后保留 `bench_plain` / `bench_hyper` 两张表，否则自动 DROP |
+| `--keep` | 否 | 结束后保留 `bench_plain` / `bench_hyper` 两张表，否则自动 DROP（仅自建模式） |
 
 报告内容包括：存储/压缩比、各查询的普通表 vs 超表耗时与提速倍数、（如测写入）写入吞吐。
 
 > 测的查询覆盖：最近 1 小时范围扫描、按天聚合、按设备分组、单设备明细、时间窗口+过滤聚合。
 > 数据量越大、范围查询越多，超表优势越明显；小数据集差距可能不明显。
+
+### 2.1 指定已有的两张表（不自建、不灌数据）
+
+如果你已经有现成的两张表想直接对比（比如脚本①转出来的 `sensor_data` 普通表和
+`sensor_data_ts` 超表），用 `--plain-table` / `--hyper-table` 指定即可：
+
+```bash
+# 基于现有数据直接跑查询对比
+python3 benchmark.py --plain-table sensor_data --hyper-table sensor_data_ts
+```
+
+这种**指定模式**与默认的自建模式区别：
+
+- **不建库、不建表、不灌数据、不清理**——直接连 `db.env` 配置的库，基于现有数据跑对比。
+- 启动时会校验两张表确实存在，不存在直接报错退出。
+- 两个参数必须**成对**出现，只给一个会报错。
+- `--rows` / `--chunk-interval` / `--segmentby` / `--keep` 在此模式下不生效，报告里相应字段标注为「指定已有超表」。
+- `--mode insert`/`both` 会**向你指定的两张表插入测试数据**，运行前会有明确告警；只对比查询请用默认的 `--mode query`。
+
+> ⚠️ 内置查询假设表里有 `ts` / `device_id` / `region` / `temperature` / `humidity` 这些列
+> （与自建表同构）。指定自己的表时，列名需匹配，否则查询会报错。
 
 ---
 
