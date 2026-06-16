@@ -1,0 +1,5 @@
+# 真实数据库连接信息，不进版本库
+db.env
+# 生成的报告
+benchmark_report.md
+*_report.md
