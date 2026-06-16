@@ -81,11 +81,18 @@ compress_after  = 7 days
 
 ### 1.2 执行转换
 
+脚本有两种模式，用 `--new-table` 控制：
+
+| `--new-table` | 行为 | 原表 |
+| --- | --- | --- |
+| `yes`（默认） | 新建一张 `<原表名>_ts` 超表，拷贝原表结构和数据 | **保留不变**，可两表并排对比 |
+| `no` | **原地把原表本身转成超表**（数据随之迁移） | 被替换；**替换前自动把原表建表 SQL 备份到 `backups/`** |
+
 ```bash
 # 先 dry-run 看看会执行哪些 SQL（不连库、不改数据）
 python3 convert_to_timescale.py tables.example.ini --dry-run
 
-# 确认无误后真正执行（原表 sensor_data 保留，新建超表 sensor_data_ts）
+# 【默认 / 新建模式】真正执行（原表 sensor_data 保留，新建超表 sensor_data_ts）
 python3 convert_to_timescale.py my_tables.ini
 
 # 换个后缀，比如 _hyper -> sensor_data_hyper
@@ -94,9 +101,21 @@ python3 convert_to_timescale.py my_tables.ini --suffix _hyper
 # 后缀表已存在时先删后建（默认会因为表已存在而报错跳过）
 python3 convert_to_timescale.py my_tables.ini --drop-existing
 
+# 【替换模式】原地把原表转成超表，替换前先把原表建表 SQL 备份到 backups/
+python3 convert_to_timescale.py my_tables.ini --new-table no
+
+# 替换模式自定义备份目录
+python3 convert_to_timescale.py my_tables.ini --new-table no --backup-dir /path/to/backups
+
 # 看每条执行的 SQL
 python3 convert_to_timescale.py my_tables.ini -v
 ```
+
+> 🛡️ **替换模式的安全网**：`--new-table no` 在替换每张表之前，会先从系统目录重建该表的
+> 建表 SQL（列定义 + 约束 + 索引），写到 `backups/<表名>_<时间戳>.sql`（默认目录为项目根
+> 的 `backups/`，可用 `--backup-dir` 改）。**备份失败则跳过该表、不做替换**。原地转换走
+> `create_hypertable(..., migrate_data => true)`，若原表存在不含时间列的主键/唯一约束会失败，
+> 此时该表事务回滚、保持原样（备份文件仍保留）。
 
 脚本对每张表依次执行：按原表结构 `CREATE TABLE <原表名>_ts (LIKE ...)` 新建空表
 → `create_hypertable` 把它变超表 →（可选）`add_dimension` 空间分区
@@ -148,16 +167,39 @@ python3 benchmark.py --mode both --rows 2000000 --runs 5 --out report.md
 | `--mode {query,insert,both}` | `query` | 测试类型，**默认只测查询** |
 | `--rows N` | `1000000` | 灌入的数据行数 |
 | `--runs N` | `3` | 每个查询重复次数取平均 |
-| `--chunk-interval STR` | `1 day` | 超表 chunk 区间 |
-| `--segmentby COL` | `device_id` | 压缩分段列；传 `''` 则不开压缩（也就不出压缩比） |
+| `--chunk-interval STR` | `1 day` | 超表 chunk 区间（仅自建模式） |
+| `--segmentby COL` | `device_id` | 压缩分段列；传 `''` 则不开压缩（也就不出压缩比，仅自建模式） |
+| `--plain-table NAME` | — | 指定**已有**的普通表名（须与 `--hyper-table` 同时给出） |
+| `--hyper-table NAME` | — | 指定**已有**的超表名（须与 `--plain-table` 同时给出） |
 | `--out PATH` | `benchmark_report.md` | 报告输出路径 |
 | `--env-file PATH` | 同目录 `db.env` | 指定连接配置文件 |
-| `--keep` | 否 | 结束后保留 `bench_plain` / `bench_hyper` 两张表，否则自动 DROP |
+| `--keep` | 否 | 结束后保留 `bench_plain` / `bench_hyper` 两张表，否则自动 DROP（仅自建模式） |
 
 报告内容包括：存储/压缩比、各查询的普通表 vs 超表耗时与提速倍数、（如测写入）写入吞吐。
 
 > 测的查询覆盖：最近 1 小时范围扫描、按天聚合、按设备分组、单设备明细、时间窗口+过滤聚合。
 > 数据量越大、范围查询越多，超表优势越明显；小数据集差距可能不明显。
+
+### 2.1 指定已有的两张表（不自建、不灌数据）
+
+如果你已经有现成的两张表想直接对比（比如脚本①转出来的 `sensor_data` 普通表和
+`sensor_data_ts` 超表），用 `--plain-table` / `--hyper-table` 指定即可：
+
+```bash
+# 基于现有数据直接跑查询对比
+python3 benchmark.py --plain-table sensor_data --hyper-table sensor_data_ts
+```
+
+这种**指定模式**与默认的自建模式区别：
+
+- **不建库、不建表、不灌数据、不清理**——直接连 `db.env` 配置的库，基于现有数据跑对比。
+- 启动时会校验两张表确实存在，不存在直接报错退出。
+- 两个参数必须**成对**出现，只给一个会报错。
+- `--rows` / `--chunk-interval` / `--segmentby` / `--keep` 在此模式下不生效，报告里相应字段标注为「指定已有超表」。
+- `--mode insert`/`both` 会**向你指定的两张表插入测试数据**，运行前会有明确告警；只对比查询请用默认的 `--mode query`。
+
+> ⚠️ 内置查询假设表里有 `ts` / `device_id` / `region` / `temperature` / `humidity` 这些列
+> （与自建表同构）。指定自己的表时，列名需匹配，否则查询会报错。
 
 ---
 

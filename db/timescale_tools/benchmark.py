@@ -4,21 +4,30 @@
 会自建两张结构完全相同的表（一张普通表、一张 hypertable），灌入相同的数据，
 然后跑同一组查询/写入，统计耗时并输出 Markdown 报告。
 
+两种用法：
+  1) 自建模式（默认）：自动建两张同构表（普通表 + hypertable），灌入相同数据后对比。
+  2) 指定模式：用 --plain-table / --hyper-table 指定两张已存在的表（一普通、一超表），
+     直接基于现有数据跑查询对比，不建库、不建表、不灌数据、不清理。
+
 用法：
-    python3 benchmark.py                       # 默认：只测查询
+    python3 benchmark.py                       # 默认：自建表，只测查询
     python3 benchmark.py --mode insert         # 只测写入
     python3 benchmark.py --mode both           # 查询 + 写入都测
     python3 benchmark.py --rows 2000000 --runs 5 --out report.md
+    # 指定已有的两张表（普通表 + 超表）做对比：
+    python3 benchmark.py --plain-table my_plain --hyper-table my_hyper
 
 主要选项：
     --mode {query,insert,both}  测试类型，默认 query
-    --rows N                    数据规模（行数），默认 1,000,000
+    --rows N                    数据规模（行数），默认 1,000,000（仅自建模式）
     --runs N                    每个查询重复次数取平均，默认 3
-    --chunk-interval STR        hypertable 的 chunk 区间，默认 "1 day"
-    --segmentby COL             开启压缩并按该列分段（默认 device_id），传空串则不压缩
+    --chunk-interval STR        hypertable 的 chunk 区间，默认 "1 day"（仅自建模式）
+    --segmentby COL             开启压缩并按该列分段（默认 device_id），传空串则不压缩（仅自建模式）
+    --plain-table NAME          指定已有的普通表名（须与 --hyper-table 同时给出）
+    --hyper-table NAME          指定已有的超表名（须与 --plain-table 同时给出）
     --out PATH                  报告输出路径，默认 benchmark_report.md
     --env-file PATH             数据库配置文件（默认同目录 db.env）
-    --keep                      测试结束后保留测试表（默认会 DROP）
+    --keep                      测试结束后保留测试表（默认会 DROP，仅自建模式）
 """
 import argparse
 import os
@@ -243,7 +252,8 @@ def write_report(path, meta, query_res, insert_res, size_info):
     lines = []
     lines.append("# 普通表 vs TimescaleDB 超表 性能对比报告\n")
     lines.append(f"- 生成时间：{meta['time']}")
-    lines.append(f"- 数据规模：{meta['rows']:,} 行")
+    rows = meta["rows"]
+    lines.append(f"- 数据规模：{rows:,} 行" if isinstance(rows, int) else f"- 数据规模：{rows}")
     lines.append(f"- chunk 区间：{meta['chunk_interval']}")
     lines.append(f"- 压缩 segmentby：{meta['segmentby'] or '（未开启）'}")
     lines.append(f"- 每项重复取平均：{meta['runs']} 次")
@@ -331,13 +341,25 @@ def main():
     ap.add_argument("--chunk-interval", default="1 day")
     ap.add_argument("--segmentby", default="device_id",
                     help="压缩分段列，传空串 '' 则不开压缩")
+    ap.add_argument("--plain-table", help="指定已有的普通表名（须与 --hyper-table 同时给出）")
+    ap.add_argument("--hyper-table", help="指定已有的超表名（须与 --plain-table 同时给出）")
     ap.add_argument("--out", default="benchmark_report.md")
     ap.add_argument("--env-file")
-    ap.add_argument("--db", help="测试用的临时库名（默认 bench_tmp_<pid>，跑完自动删除）")
-    ap.add_argument("--keep", action="store_true", help="结束后保留临时库与测试表")
+    ap.add_argument("--db", help="测试用的临时库名（默认 bench_tmp_<pid>，跑完自动删除；仅自建模式）")
+    ap.add_argument("--keep", action="store_true", help="结束后保留临时库与测试表（仅自建模式）")
     args = ap.parse_args()
 
+    # 是否使用用户指定的两张已有表
+    use_existing = bool(args.plain_table or args.hyper_table)
+    if use_existing and not (args.plain_table and args.hyper_table):
+        ap.error("--plain-table 与 --hyper-table 必须同时指定")
+
     dsn = get_dsn(args.env_file)
+
+    if use_existing:
+        run_existing(dsn, args)
+        return
+
     tmp_db = args.db or f"bench_tmp_{os.getpid()}"
 
     log(f"[*] 创建隔离测试库: {tmp_db}（与你的业务库/CDC 完全隔离）")
@@ -372,6 +394,46 @@ def main():
             log(f"[*] 已删除临时库 {tmp_db}（如需保留请加 --keep）")
         else:
             log(f"[*] 已保留临时库 {tmp_db}")
+
+
+def assert_tables_exist(conn, *tables):
+    """确认指定的表都存在，否则报错退出。"""
+    with conn.cursor() as cur:
+        for tbl in tables:
+            cur.execute("SELECT to_regclass(%s);", (tbl,))
+            if cur.fetchone()[0] is None:
+                raise SystemExit(f"[错误] 表不存在或不可见: {tbl}")
+
+
+def run_existing(dsn, args):
+    """指定模式：直接基于两张已有表跑对比，不建库/建表/灌数据/清理。"""
+    global PLAIN_TABLE, HYPER_TABLE
+    PLAIN_TABLE = args.plain_table
+    HYPER_TABLE = args.hyper_table
+
+    log(f"[*] 指定模式：普通表 = {PLAIN_TABLE}，超表 = {HYPER_TABLE}")
+    log("    （直接使用现有表与数据，不会建库/建表/灌数据/清理）")
+    conn = psycopg2.connect(dsn)
+    try:
+        assert_tables_exist(conn, PLAIN_TABLE, HYPER_TABLE)
+
+        query_res = run_query_bench(conn, args.runs) if args.mode in ("query", "both") else None
+        insert_res = None
+        if args.mode in ("insert", "both"):
+            insert_rows = max(10000, args.rows // 10)
+            log("[!] 注意：写入测试会向你指定的两张表插入测试数据。")
+            insert_res = run_insert_bench(conn, insert_rows, args.runs)
+
+        meta = {
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "rows": f"{PLAIN_TABLE} / {HYPER_TABLE}（现有数据）",
+            "runs": args.runs,
+            "chunk_interval": "（指定已有超表）",
+            "segmentby": "（指定已有超表）", "mode": args.mode,
+        }
+        write_report(args.out, meta, query_res, insert_res, None)
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":
