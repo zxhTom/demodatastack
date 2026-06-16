@@ -1,0 +1,2 @@
+nohup: 忽略输入
+/usr/bin/python: Error while finding module specification for 'anchor_crawler.main' (ModuleNotFoundError: No module named 'anchor_crawler')

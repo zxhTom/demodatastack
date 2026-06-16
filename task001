@@ -1,0 +1,31 @@
+nohup: 忽略输入
+Warning: no stdin data received in 3s, proceeding without it. If piping from a slow command, redirect stdin explicitly: < /dev/null to skip, or wait longer.
+全部完成并已用真实数据库验证通过。文件都在 `db/timescale_tools/`：
+
+| 文件 | 作用 |
+|---|---|
+| `db.env.example` | 数据库连接模板，`cp db.env.example db.env` 后改成你自己的，已加入 `.gitignore` 不会提交 |
+| `dbconfig.py` | 共享连接加载器，优先级：环境变量 > `db.env` > 内置默认 |
+| `convert_to_timescale.py` | **脚本①** 按清单把普通表转超表 |
+| `tables.example.ini` | **清单模板**，含 `time_column`/`chunk_interval`/`segmentby`/`orderby`/`compress_after`/`space_partition` 等字段 |
+| `benchmark.py` | **脚本②** 普通表 vs 超表性能对比，输出 Markdown 报告 |
+| `README.md` | 完整操作说明 |
+
+**核心设计与决策：**
+
+1. **连接信息独立维护**：单独放 `db.env`（key=value），脚本不写死，可用环境变量临时覆盖（`DB_NAME=xxx python3 ...`）。
+
+2. **转换清单用 INI**：每个 `[表名]` 一节，只有 `time_column` 必填，其余可选。脚本依次执行 `create_hypertable → add_dimension(空间分区) → 开启压缩 → 压缩策略`，**每表一个事务，失败自动回滚不影响其它表**，支持 `--dry-run` 先看 SQL。
+
+3. **性能脚本**：`--mode query|insert|both`，**默认只测查询**；测 5 类查询（范围扫描/按天聚合/分组/明细/窗口过滤），开压缩时额外给压缩比；报告为 Markdown。
+
+**验证结果**：
+- 转换器在真实表上跑通——成功建超表、开压缩、加策略，**1000 行数据完整保留**。
+- 基准测试跑通，生成了含压缩比(2.04x)、查询提速、写入吞吐的报告。
+
+**两个针对你这个项目的重要提醒（已写进 README 常见问题）：**
+
+- 你的 `edumanage` 库有 `dbz_publication FOR ALL TABLES`（CDC 用），它会**阻止建超表**。转换真实表前需临时 `DROP PUBLICATION` → 转换 → 重建为具名发布（`FOR ALL TABLES` 无法单独排除某表）。
+- 因此**性能脚本特意在 `bench_tmp_<pid>` 临时库里跑**，测完即删，完全不碰你的业务库和 CDC。
+
+注：小数据量(8万行)时超表查询反而比普通表慢属正常——压缩/分块路由的固定开销在小数据集占比大，数据量上百万、范围查询多时优势才显现，报告末尾的「说明」已注明。真实评测建议 `--rows 2000000` 以上。
