@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """把普通表批量转换成 TimescaleDB 超表(hypertable)。
 
+⚠️ 重要：本脚本**不会修改/替换原表**。它会按 <原表名> + 后缀（默认 _ts）
+新建一张超表，把原表的结构和数据拷贝过去，原表原封不动保留，方便你两张表对比。
+
 用法：
     python3 convert_to_timescale.py <清单文件.ini> [选项]
 
@@ -8,6 +11,8 @@
 
 选项：
     --env-file PATH   指定数据库配置文件（默认同目录 db.env）
+    --suffix STR      新超表名后缀（默认 _ts），如原表 sensor_data -> sensor_data_ts
+    --drop-existing   若同名后缀表已存在，先 DROP 再重建（默认跳过已存在的）
     --dry-run         只打印将要执行的 SQL，不真正执行
     -v, --verbose     打印每条执行的 SQL
 """
@@ -18,6 +23,8 @@ import sys
 import psycopg2
 
 from dbconfig import get_dsn
+
+DEFAULT_SUFFIX = "_ts"
 
 
 def _bool(val, default=True):
@@ -60,11 +67,35 @@ def ident(schema, table):
     return f'"{table}"'
 
 
-def build_statements(section, cfg):
-    """为单张表生成 (说明, SQL, 参数) 列表。"""
+def target_name(cfg, table, suffix):
+    """计算新超表名：优先用 section 里的 target，否则原表名加后缀。"""
+    override = cfg.get("target", "").strip()
+    return override if override else f"{table}{suffix}"
+
+
+def count_rows(conn, fq):
+    """返回某张表的行数（出错返回 None）。"""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT count(*) FROM {fq};")
+            return cur.fetchone()[0]
+    except psycopg2.Error:
+        conn.rollback()
+        return None
+
+
+def build_statements(section, cfg, suffix, drop_existing):
+    """为单张表生成 (说明, SQL) 列表。
+
+    生成的是「新建后缀超表 + 拷贝原表数据」的 SQL，原表不动。
+    """
     schema, table = qualify(section)
-    fq = ident(schema, table)
-    rel_literal = (f"{schema}.{table}" if schema else table)
+    src_fq = ident(schema, table)                      # 原表（只读）
+    src_literal = f"{schema}.{table}" if schema else table
+
+    new_table = target_name(cfg, table, suffix)
+    new_fq = ident(schema, new_table)                  # 新超表
+    new_literal = f"{schema}.{new_table}" if schema else new_table
 
     time_column = cfg.get("time_column").strip()
     chunk_interval = cfg.get("chunk_interval", "7 days").strip()
@@ -74,56 +105,81 @@ def build_statements(section, cfg):
     space_partition = cfg.get("space_partition", "").strip()
     number_partitions = cfg.get("number_partitions", "").strip()
     migrate_data = _bool(cfg.get("migrate_data"), default=True)
-    if_not_exists = _bool(cfg.get("if_not_exists"), default=True)
 
     stmts = []
 
-    # 1) create_hypertable
-    args = [f"'{rel_literal}'", f"by_range('{time_column}', INTERVAL '{chunk_interval}')"]
-    create = (
-        f"SELECT create_hypertable("
-        f"'{rel_literal}', by_range('{time_column}', INTERVAL '{chunk_interval}'), "
-        f"migrate_data => {str(migrate_data).lower()}, "
-        f"if_not_exists => {str(if_not_exists).lower()});"
-    )
-    stmts.append((f"创建 hypertable（分区列={time_column}, chunk={chunk_interval}）", create))
+    # 0) 可选：先删掉已存在的同名后缀表（只删我们建的后缀表，绝不碰原表）
+    if drop_existing:
+        stmts.append((
+            f"删除已存在的目标表 {new_literal}（如有）",
+            f"DROP TABLE IF EXISTS {new_fq} CASCADE;",
+        ))
 
-    # 1b) 二级空间分区
+    # 1) 按原表结构新建一张空表（拷贝列/默认值/生成列/存储参数/注释；
+    #    不拷贝索引和约束——含非时间列的主键/唯一约束会让 create_hypertable 失败）
+    stmts.append((
+        f"按 {src_literal} 的结构新建空表 {new_literal}",
+        f"CREATE TABLE {new_fq} (LIKE {src_fq} "
+        f"INCLUDING DEFAULTS INCLUDING GENERATED INCLUDING IDENTITY "
+        f"INCLUDING STORAGE INCLUDING COMMENTS);",
+    ))
+
+    # 2) 把新表变成 hypertable（此时是空表，无需 migrate_data）
+    stmts.append((
+        f"把 {new_literal} 变成 hypertable（分区列={time_column}, chunk={chunk_interval}）",
+        f"SELECT create_hypertable("
+        f"'{new_literal}', by_range('{time_column}', INTERVAL '{chunk_interval}'), "
+        f"if_not_exists => true);",
+    ))
+
+    # 2b) 二级空间分区（必须在灌数据之前加）
     if space_partition:
         npart = number_partitions or "4"
-        space = (
+        stmts.append((
+            f"添加空间分区（{space_partition} x {npart}）",
             f"SELECT add_dimension("
-            f"'{rel_literal}', by_hash('{space_partition}', {npart}), "
-            f"if_not_exists => true);"
-        )
-        stmts.append((f"添加空间分区（{space_partition} x {npart}）", space))
+            f"'{new_literal}', by_hash('{space_partition}', {npart}), "
+            f"if_not_exists => true);",
+        ))
 
-    # 2) 列存压缩（填了 segmentby 才开启）
+    # 3) 把原表数据拷进新超表（原表只读，不受影响）
+    if migrate_data:
+        stmts.append((
+            f"拷贝 {src_literal} 的数据到 {new_literal}",
+            f"INSERT INTO {new_fq} SELECT * FROM {src_fq};",
+        ))
+
+    # 4) 列存压缩（填了 segmentby 才开启）
     if segmentby:
         order_clause = orderby or f"{time_column} DESC"
-        enable = (
-            f"ALTER TABLE {fq} SET ("
+        stmts.append((
+            f"开启列存压缩（segmentby={segmentby}, orderby={order_clause}）",
+            f"ALTER TABLE {new_fq} SET ("
             f"timescaledb.compress, "
             f"timescaledb.compress_segmentby = '{segmentby}', "
-            f"timescaledb.compress_orderby = '{order_clause}');"
-        )
-        stmts.append((f"开启列存压缩（segmentby={segmentby}, orderby={order_clause}）", enable))
+            f"timescaledb.compress_orderby = '{order_clause}');",
+        ))
 
-        # 3) 自动压缩策略
+        # 5) 自动压缩策略
         if compress_after:
-            policy = (
+            stmts.append((
+                f"添加自动压缩策略（{compress_after} 后压缩）",
                 f"SELECT add_compression_policy("
-                f"'{rel_literal}', INTERVAL '{compress_after}', if_not_exists => true);"
-            )
-            stmts.append((f"添加自动压缩策略（{compress_after} 后压缩）", policy))
+                f"'{new_literal}', INTERVAL '{compress_after}', if_not_exists => true);",
+            ))
 
     return stmts
 
 
 def main():
-    ap = argparse.ArgumentParser(description="把普通表批量转成 TimescaleDB 超表")
+    ap = argparse.ArgumentParser(
+        description="把普通表批量转成 TimescaleDB 超表（新建后缀表，不动原表）")
     ap.add_argument("tables_file", help="表转换清单文件（INI）")
     ap.add_argument("--env-file", help="数据库配置文件路径（默认同目录 db.env）")
+    ap.add_argument("--suffix", default=DEFAULT_SUFFIX,
+                    help=f"新超表名后缀（默认 {DEFAULT_SUFFIX}）")
+    ap.add_argument("--drop-existing", action="store_true",
+                    help="若后缀表已存在则先 DROP 重建（默认跳过已存在的）")
     ap.add_argument("--dry-run", action="store_true", help="只打印 SQL 不执行")
     ap.add_argument("-v", "--verbose", action="store_true", help="打印每条 SQL")
     args = ap.parse_args()
@@ -131,12 +187,13 @@ def main():
     tables = parse_tables(args.tables_file)
     dsn = get_dsn(args.env_file)
 
-    print(f"[*] 共解析到 {len(tables)} 张待转换的表\n")
+    print(f"[*] 共解析到 {len(tables)} 张待转换的表")
+    print(f"[*] 目标超表命名：<原表名>{args.suffix}（原表保留不变，可对比）\n")
 
     if args.dry_run:
         for section, cfg in tables:
             print(f"--- {section} ---")
-            for desc, sql in build_statements(section, cfg):
+            for desc, sql in build_statements(section, cfg, args.suffix, args.drop_existing):
                 print(f"-- {desc}\n{sql}\n")
         print("[dry-run] 未连接数据库，未执行任何 SQL。")
         return
@@ -153,7 +210,7 @@ def main():
         for section, cfg in tables:
             print(f"==> 处理表 {section}")
             try:
-                for desc, sql in build_statements(section, cfg):
+                for desc, sql in build_statements(section, cfg, args.suffix, args.drop_existing):
                     if args.verbose:
                         print(f"    SQL: {sql}")
                     with conn.cursor() as cur:
@@ -161,11 +218,26 @@ def main():
                     print(f"    ✓ {desc}")
                 conn.commit()
                 ok += 1
+
+                # 校验：对比原表与新超表的行数，确认数据确实拷过去了
+                schema, table = qualify(section)
+                src_fq = ident(schema, table)
+                new_fq = ident(schema, target_name(cfg, table, args.suffix))
+                src_n = count_rows(conn, src_fq)
+                new_n = count_rows(conn, new_fq)
+                conn.commit()
+                if src_n is None or new_n is None:
+                    print(f"    · 行数校验跳过（无法读取计数）")
+                elif src_n == new_n:
+                    print(f"    ✓ 行数校验通过：原表 {src_n:,} 行 = 超表 {new_n:,} 行")
+                else:
+                    print(f"    ⚠ 行数不一致：原表 {src_n:,} 行 ≠ 超表 {new_n:,} 行"
+                          f"（检查 migrate_data 是否为 true，或表中途有写入）")
             except psycopg2.Error as e:
                 conn.rollback()
                 fail += 1
                 print(f"    ✗ 失败: {str(e).strip()}")
-        print(f"\n[完成] 成功 {ok} 张，失败 {fail} 张。")
+        print(f"\n[完成] 成功 {ok} 张，失败 {fail} 张。原表均未改动。")
     finally:
         conn.close()
 
