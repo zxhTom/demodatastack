@@ -2,4 +2,5 @@
 db.env
 # 生成的报告
 benchmark_report.md
+backups/
 *_report.md
