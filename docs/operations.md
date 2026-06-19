@@ -11,7 +11,7 @@
 ### 一键启动
 
 ```bash
-cd /home/zxhtom/temp/github/claudecode
+cd /home/zxhtom/temp/github/demodatastack
 
 # 1. 启动基础服务（PostgreSQL、Zookeeper、Redis）
 DOCKER_API_VERSION=1.44 docker-compose up -d postgres-primary zookeeper redis
