@@ -40,7 +40,8 @@ python seed_meter_data.py --start 2025-01-01 --end 2025-01-31
 | `--batch-size` | 批量写入的行数，默认 `2000` |
 | `--env-file` | 自定义 `db.env` 路径，默认脚本同目录下的 `db.env` |
 | `--dry-run` | 只打印将要生成的行数，不连库写入 |
-| `--yes` | `rebuild` 模式下确认会先删除该时间范围内的现有数据 |
+| `--sql-out` | 把生成的 INSERT/DELETE 语句写入指定文件，不直接执行写入（仍会连库读取 `c_meter`/累计电量基线，用于保证生成数据正确） |
+| `--yes` | `rebuild` 模式下确认会先删除该时间范围内的现有数据（使用 `--sql-out` 时不需要，因为不会立即执行删除） |
 
 示例：
 
@@ -54,6 +55,9 @@ python seed_meter_data.py --meters 1001,1002 --start 2025-01-01 --end 2025-01-07
 # 重建某个时间范围内某几张表的数据（会先删除旧数据，需要 --yes 确认）
 python seed_meter_data.py --tables d_load_power,d_load_voltage \
     --start 2025-02-01 --end 2025-02-28 --mode rebuild --yes
+
+# 不直接写库，把要执行的 SQL 输出到文件，自己检查后再手动执行
+python seed_meter_data.py --start 2025-01-01 --days 7 --sql-out seed.sql
 ```
 
 ## 累计电量基线

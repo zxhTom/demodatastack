@@ -435,21 +435,26 @@ def apply_baseline(state, baseline):
         state.rv.r = float(baseline["rv_r"] or 0)
 
 
+def conflict_clause(cols, mode):
+    if mode == "fill":
+        return f"ON CONFLICT ({', '.join(PK)}) DO NOTHING"
+    # overwrite / rebuild (rebuild already deleted the range, but keep upsert as safety net)
+    set_clause = ", ".join(f"{c} = EXCLUDED.{c}" for c in cols if c not in PK)
+    return f"ON CONFLICT ({', '.join(PK)}) DO UPDATE SET {set_clause}"
+
+
+def insert_sql(table, cols, mode):
+    col_list = ", ".join(cols)
+    placeholders = "(" + ", ".join(["%s"] * len(cols)) + ")"
+    return f"INSERT INTO {table} ({col_list}) VALUES {placeholders} {conflict_clause(cols, mode)}"
+
+
 def insert_rows(conn, table, rows, mode, batch_size):
     if not rows:
         return 0
     cols = sorted(rows[0].keys())
     values = [[r[c] for c in cols] for r in rows]
-    col_list = ", ".join(cols)
-    placeholders = "(" + ", ".join(["%s"] * len(cols)) + ")"
-
-    if mode == "fill":
-        conflict = f"ON CONFLICT ({', '.join(PK)}) DO NOTHING"
-    else:  # overwrite / rebuild (rebuild already deleted the range, but keep upsert as safety net)
-        set_clause = ", ".join(f"{c} = EXCLUDED.{c}" for c in cols if c not in PK)
-        conflict = f"ON CONFLICT ({', '.join(PK)}) DO UPDATE SET {set_clause}"
-
-    sql = f"INSERT INTO {table} ({col_list}) VALUES {placeholders} {conflict}"
+    sql = insert_sql(table, cols, mode)
     total = 0
     with conn.cursor() as cur:
         for i in range(0, len(values), batch_size):
@@ -459,6 +464,29 @@ def insert_rows(conn, table, rows, mode, batch_size):
     return total
 
 
+def mogrify_insert_statements(conn, table, rows, mode, batch_size):
+    """生成等价的 INSERT 语句文本，不连库执行，用于 --sql-out 模式。"""
+    if not rows:
+        return []
+    cols = sorted(rows[0].keys())
+    values = [[r[c] for c in cols] for r in rows]
+    col_list = ", ".join(cols)
+    placeholders = "(" + ", ".join(["%s"] * len(cols)) + ")"
+    conflict = conflict_clause(cols, mode)
+
+    statements = []
+    with conn.cursor() as cur:
+        for i in range(0, len(values), batch_size):
+            chunk = values[i:i + batch_size]
+            value_list = ", ".join(
+                cur.mogrify(placeholders, row).decode("utf-8") for row in chunk
+            )
+            statements.append(
+                f"INSERT INTO {table} ({col_list}) VALUES {value_list} {conflict};"
+            )
+    return statements
+
+
 def delete_range(conn, table, mp_ids, start, end):
     with conn.cursor() as cur:
         cur.execute(
@@ -466,6 +494,15 @@ def delete_range(conn, table, mp_ids, start, end):
             (mp_ids, start, end),
         )
         return cur.rowcount
+
+
+def mogrify_delete_statement(conn, table, mp_ids, start, end):
+    """生成等价的 DELETE 语句文本，不连库执行，用于 --sql-out 模式。"""
+    with conn.cursor() as cur:
+        return cur.mogrify(
+            f"DELETE FROM {table} WHERE mp_id = any(%s) AND data_date BETWEEN %s AND %s;",
+            (mp_ids, start, end),
+        ).decode("utf-8")
 
 
 def parse_args():
@@ -480,7 +517,8 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=2000)
     p.add_argument("--env-file", help="db.env 路径，默认脚本同目录下的 db.env")
     p.add_argument("--dry-run", action="store_true", help="只打印将要生成的行数，不连库写入")
-    p.add_argument("--yes", action="store_true", help="rebuild 模式会先删除范围内数据，需要这个开关确认")
+    p.add_argument("--sql-out", help="将生成的 INSERT/DELETE 语句写入此文件，不直接执行写入（仍会连库读取 c_meter/基线数据）")
+    p.add_argument("--yes", action="store_true", help="rebuild 模式会先删除范围内数据，需要这个开关确认（使用 --sql-out 时不需要，因为不会立即执行删除）")
     return p.parse_args()
 
 
@@ -514,12 +552,13 @@ def main():
         sys.exit(f"未知表名: {unknown}")
     meter_ids = [int(x) for x in args.meters.split(",")] if args.meters else None
 
-    if args.mode == "rebuild" and not args.dry_run and not args.yes:
-        sys.exit("rebuild 模式会先删除该时间范围内的现有数据，请加 --yes 确认")
+    if args.mode == "rebuild" and not args.dry_run and not args.sql_out and not args.yes:
+        sys.exit("rebuild 模式会先删除该时间范围内的现有数据，请加 --yes 确认（或改用 --sql-out 只生成 SQL）")
 
     dsn = dbconfig.get_dsn(args.env_file)
     conn = psycopg2.connect(dsn)
     conn.autocommit = False
+    sql_file = open(args.sql_out, "w", encoding="utf-8") if args.sql_out else None
     try:
         meters = fetch_meters(conn, meter_ids)
         if not meters:
@@ -534,10 +573,18 @@ def main():
                   f" = {len(meters) * len(tables) * n_days * SLOTS_PER_DAY}")
             return
 
+        if sql_file:
+            print(f"SQL 输出模式：不会直接写库，语句将写入 {args.sql_out}")
+
         if args.mode == "rebuild":
             for t in tables:
-                deleted = delete_range(conn, t, mp_ids, start, end)
-                print(f"[rebuild] {t}: deleted {deleted} rows in range")
+                if sql_file:
+                    stmt = mogrify_delete_statement(conn, t, mp_ids, start, end)
+                    sql_file.write(stmt + "\n")
+                    print(f"[rebuild] {t}: DELETE 语句已写入文件")
+                else:
+                    deleted = delete_range(conn, t, mp_ids, start, end)
+                    print(f"[rebuild] {t}: deleted {deleted} rows in range")
 
         baselines = {
             t: fetch_baseline(conn, t, mp_ids, start)
@@ -547,6 +594,17 @@ def main():
 
         buffers = {t: [] for t in tables}
         total_written = {t: 0 for t in tables}
+
+        def flush(t):
+            if not buffers[t]:
+                return
+            if sql_file:
+                for stmt in mogrify_insert_statements(conn, t, buffers[t], args.mode, args.batch_size):
+                    sql_file.write(stmt + "\n")
+                total_written[t] += len(buffers[t])
+            else:
+                total_written[t] += insert_rows(conn, t, buffers[t], args.mode, args.batch_size)
+            buffers[t] = []
 
         for meter_id, org_no in meters:
             state = MeterState(meter_id, org_no)
@@ -562,25 +620,27 @@ def main():
 
             for t in tables:
                 if len(buffers[t]) >= args.batch_size * 4:
-                    total_written[t] += insert_rows(conn, t, buffers[t], args.mode, args.batch_size)
-                    buffers[t] = []
+                    flush(t)
             conn.commit()
             print(f"meter {meter_id} done")
 
         for t in tables:
-            if buffers[t]:
-                total_written[t] += insert_rows(conn, t, buffers[t], args.mode, args.batch_size)
-                buffers[t] = []
+            flush(t)
         conn.commit()
 
         for t in tables:
-            verb = "skipped existing / inserted missing among" if args.mode == "fill" else "written"
-            print(f"{t}: {total_written[t]} rows processed ({verb})")
+            if sql_file:
+                print(f"{t}: {total_written[t]} 行已写入 SQL 文件")
+            else:
+                verb = "skipped existing / inserted missing among" if args.mode == "fill" else "written"
+                print(f"{t}: {total_written[t]} rows processed ({verb})")
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
+        if sql_file:
+            sql_file.close()
 
 
 if __name__ == "__main__":
