@@ -50,18 +50,25 @@ TABLES = [
     "d_demand_curve",
 ]
 
-WRONG_PROFILE_ID = 1
-NEW_PROFILE_ID   = 40930000011
+NEW_PROFILE_ID = 40930000011
+
+# 识别"错误行"的条件：t.mp_id 实际上是个 meter_id，r_mp 里存的才是真正的 mp_id。
+# 用 rmp.meter_id = t.mp_id 反查，且 rmp.mp_id != t.mp_id 确认值确实需要修改。
+# 不依赖 profile_id，因为修复过程中有些行已经写了 40930000011 但 mp_id 仍然错误。
+_WRONG_COND = """
+    JOIN r_mp rmp
+      ON rmp.meter_id = t.mp_id
+     AND rmp.is_delete = '01'
+     AND rmp.mp_id    != t.mp_id
+"""
 
 
 def get_date_range(conn):
-    """获取所有表中 profile_id=1 的数据的日期范围。"""
     mn, mx = date.max, date.min
     with conn.cursor() as cur:
         for t in TABLES:
             cur.execute(
-                f"SELECT MIN(data_date), MAX(data_date) FROM {t} WHERE profile_id = %s",
-                (WRONG_PROFILE_ID,),
+                f"SELECT MIN(t.data_date), MAX(t.data_date) FROM {t} t {_WRONG_COND}"
             )
             row = cur.fetchone()
             if row[0]:
@@ -73,24 +80,24 @@ def get_date_range(conn):
 def count_rows(conn, table, start, end):
     with conn.cursor() as cur:
         cur.execute(
-            f"SELECT COUNT(*) FROM {table} "
-            "WHERE profile_id = %s AND data_date BETWEEN %s AND %s",
-            (WRONG_PROFILE_ID, start, end),
+            f"SELECT COUNT(*) FROM {table} t {_WRONG_COND} "
+            "WHERE t.data_date BETWEEN %s AND %s",
+            (start, end),
         )
         return cur.fetchone()[0]
 
 
 def fix_chunk(conn, table, chunk_start, chunk_end):
-    """对一个日期区间执行 UPDATE，返回实际更新行数。"""
+    """识别：t.mp_id == meter_id（非真实 mp_id），用 r_mp 修正三个字段。"""
     sql = f"""
         UPDATE {table} t
         SET    mp_id      = rmp.mp_id,
                tmnl_id   = rmp.tmnl_id,
                profile_id = {NEW_PROFILE_ID}
         FROM   r_mp rmp
-        WHERE  t.profile_id = {WRONG_PROFILE_ID}
-          AND  rmp.meter_id = t.mp_id
+        WHERE  rmp.meter_id = t.mp_id
           AND  rmp.is_delete = '01'
+          AND  rmp.mp_id    != t.mp_id
           AND  t.data_date BETWEEN %s AND %s
     """
     with conn.cursor() as cur:

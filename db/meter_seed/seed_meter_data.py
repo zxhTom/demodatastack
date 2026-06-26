@@ -624,14 +624,18 @@ def main():
                     deleted = delete_range(conn, t, mp_ids, start, end)
                     print(f"[rebuild] {t}: deleted {deleted} rows in range")
 
-        baselines = {
-            t: fetch_baseline(conn, t, mp_ids, start)
-            for t in ("d_read_curve", "d_read_curve_r", "d_read_curve_v")
-            if t in tables
-        }
+        baseline_tables = [t for t in ("d_read_curve", "d_read_curve_r", "d_read_curve_v") if t in tables]
+        baselines = {}
+        for t in baseline_tables:
+            print(f"loading baseline: {t} ...", flush=True)
+            baselines[t] = fetch_baseline(conn, t, mp_ids, start)
+        if baseline_tables:
+            print("baseline loaded.", flush=True)
 
         buffers = {t: [] for t in tables}
         total_written = {t: 0 for t in tables}
+        import time as _time
+        _t0 = _time.time()
 
         def flush(t):
             if not buffers[t]:
@@ -645,7 +649,8 @@ def main():
             buffers[t] = []
 
         def _run_meters(prog, meter_task, day_task):
-            for meter_id, org_no, mp_id, tmnl_id in meters:
+            total_m = len(meters)
+            for mi, (meter_id, org_no, mp_id, tmnl_id) in enumerate(meters):
                 if prog:
                     prog.update(meter_task,
                                 description=f"[cyan]mp_id={mp_id}[/cyan] [dim](meter {meter_id})[/dim]")
@@ -674,6 +679,14 @@ def main():
                 if prog:
                     prog.update(day_task, completed=n_days)
                     prog.advance(meter_task)
+                else:
+                    done = mi + 1
+                    elapsed = _time.time() - _t0
+                    eta = (elapsed / done * (total_m - done)) if done else 0
+                    h, r = divmod(int(eta), 3600)
+                    m2, s = divmod(r, 60)
+                    eta_str = f"{h}:{m2:02d}:{s:02d}" if h else f"{m2:02d}:{s:02d}"
+                    print(f"[{done}/{total_m}] mp_id={mp_id}  ETA {eta_str}", flush=True)
 
         if RICH and not sql_file:
             console = Console()
@@ -688,7 +701,7 @@ def main():
                 console=console,
                 transient=False,
             ) as prog:
-                m_task = prog.add_task(f"[bold]设备[/bold]", total=len(meters))
+                m_task = prog.add_task("[bold]设备[/bold]", total=len(meters))
                 d_task = prog.add_task("[dim]日期[/dim]", total=n_days)
                 _run_meters(prog, m_task, d_task)
         else:
