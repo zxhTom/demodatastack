@@ -164,10 +164,15 @@ def common(mp_id, org_no, dt, profile_id):
 
 def row_voltage(base, slot):
     base.update(slot)
+    ua, ub, uc = slot["ua"], slot["ub"], slot["uc"]
+    # 线间电压：|Uab| = sqrt(Ua²+Ub²+Ua·Ub)（两相差120°的相量模）
+    cav12 = round(math.sqrt(ua**2 + ub**2 + ua * ub), 4)
+    cav23 = round(math.sqrt(ub**2 + uc**2 + ub * uc), 4)
+    cav31 = round(math.sqrt(uc**2 + ua**2 + uc * ua), 4)
     return dict(
-        ua=round(slot["ua"], 4), ub=round(slot["ub"], 4), uc=round(slot["uc"], 4),
-        cava=round(slot["ua"], 4), cavb=round(slot["ub"], 4), cavc=round(slot["uc"], 4),
-        uab=round(slot["ua"] - slot["ub"], 4),
+        ua=round(ua, 4), ub=round(ub, 4), uc=round(uc, 4),
+        cava=round(ua, 4), cavb=round(ub, 4), cavc=round(uc, 4),
+        cav12=cav12, cav23=cav23, cav31=cav31,
         st_v=0,
     )
 
