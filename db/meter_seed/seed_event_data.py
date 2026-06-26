@@ -13,6 +13,16 @@ import psycopg2.extras
 
 import dbconfig
 
+try:
+    from rich.console import Console
+    from rich.progress import (
+        BarColumn, MofNCompleteColumn, Progress, SpinnerColumn,
+        TaskProgressColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn,
+    )
+    RICH = True
+except ImportError:
+    RICH = False
+
 ALL_TABLES = [
     "d_alarm_event",
     "d_communication_event_log",
@@ -282,16 +292,46 @@ def main():
         if sql_file:
             print(f"SQL 输出模式：语句将写入 {args.sql_out}")
 
-        for table in sorted(tables):
-            rows = build_rows(table, meters, args.count, start_dt, end_dt, args.seed)
-            if sql_file:
-                for stmt in mogrify_rows(conn, table, rows, args.batch_size):
-                    sql_file.write(stmt + "\n")
-                print(f"  {table}: {len(rows)} 行已写入 SQL 文件")
-            else:
-                inserted = insert_rows(conn, table, rows, args.batch_size)
-                conn.commit()
-                print(f"  {table}: 生成 {len(rows)} 行，实际插入 {inserted} 行")
+        sorted_tables = sorted(tables)
+
+        def _run_tables(prog, tbl_task):
+            for ti, table in enumerate(sorted_tables):
+                if prog:
+                    prog.update(tbl_task,
+                                description=f"[cyan]{table}[/cyan]",
+                                completed=ti)
+                rows = build_rows(table, meters, args.count, start_dt, end_dt, args.seed)
+                if sql_file:
+                    for stmt in mogrify_rows(conn, table, rows, args.batch_size):
+                        sql_file.write(stmt + "\n")
+                    if not prog:
+                        print(f"  {table}: {len(rows)} 行已写入 SQL 文件")
+                else:
+                    inserted = insert_rows(conn, table, rows, args.batch_size)
+                    conn.commit()
+                    if not prog:
+                        print(f"  {table}: 生成 {len(rows)} 行，实际插入 {inserted} 行")
+            if prog:
+                prog.update(tbl_task, completed=len(sorted_tables),
+                            description="[bold green]完成[/bold green]")
+
+        if RICH and not sql_file:
+            console = Console()
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("{task.description}"),
+                BarColumn(bar_width=36),
+                MofNCompleteColumn(),
+                TaskProgressColumn(),
+                TimeElapsedColumn(),
+                TimeRemainingColumn(),
+                console=console,
+                transient=False,
+            ) as prog:
+                t_task = prog.add_task("[bold]表[/bold]", total=len(sorted_tables))
+                _run_tables(prog, t_task)
+        else:
+            _run_tables(None, None)
 
     except Exception:
         conn.rollback()

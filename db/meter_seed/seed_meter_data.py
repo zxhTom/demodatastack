@@ -17,6 +17,16 @@ import psycopg2.extras
 
 import dbconfig
 
+try:
+    from rich.console import Console
+    from rich.progress import (
+        BarColumn, MofNCompleteColumn, Progress, SpinnerColumn,
+        TaskProgressColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn,
+    )
+    RICH = True
+except ImportError:
+    RICH = False
+
 PK = ("mp_id", "data_date", "data_time", "profile_id", "supply_id")
 SLOT_MINUTES = 15
 SLOTS_PER_DAY = 24 * 60 // SLOT_MINUTES
@@ -82,9 +92,11 @@ class SimpleRegister:
 
 
 class MeterState:
-    def __init__(self, meter_id, org_no):
+    def __init__(self, meter_id, org_no, mp_id, tmnl_id):
         self.meter_id = int(meter_id)
-        self.org_no = org_no
+        self.mp_id    = int(mp_id)
+        self.tmnl_id  = int(tmnl_id)
+        self.org_no   = org_no
         self.rng = random.Random(self.meter_id * 1_000_003 + 17)
         self.base_kw = self.rng.uniform(2.0, 18.0)
         self.pf_base = self.rng.uniform(0.93, 0.99)
@@ -146,14 +158,14 @@ def build_slot(state, dt):
     )
 
 
-def common(mp_id, org_no, dt, profile_id):
+def common(mp_id, tmnl_id, org_no, dt, profile_id):
     return dict(
         mp_id=mp_id,
         data_date=dt.date(),
         data_time=dt.strftime("%H:%M"),
         task_id=None,
         data_src="01",
-        tmnl_id=mp_id,
+        tmnl_id=tmnl_id,
         org_no=org_no,
         coll_time=dt,
         freeze_time=dt,
@@ -331,7 +343,7 @@ def row_demand_curve(state, slot):
 def gen_rows_for_slot(state, dt, profile_id, tables):
     slot = build_slot(state, dt)
     bucket = tou_bucket(dt.hour)
-    base_common = common(state.meter_id, state.org_no, dt, profile_id)
+    base_common = common(state.mp_id, state.tmnl_id, state.org_no, dt, profile_id)
     rows = {}
 
     if "d_load_voltage" in tables:
@@ -379,15 +391,30 @@ def daterange(start, end):
 
 
 def fetch_meters(conn, meter_ids):
+    """从 c_meter JOIN r_mp(is_delete='01') 取有效的 mp_id 和 tmnl_id。
+    没有对应 r_mp 记录的 meter 自动跳过。"""
     with conn.cursor() as cur:
         if meter_ids:
             cur.execute(
-                "select meter_id, org_no from c_meter where meter_id = any(%s) order by meter_id",
+                """
+                SELECT cm.meter_id, cm.org_no, rmp.mp_id, rmp.tmnl_id
+                FROM c_meter cm
+                JOIN r_mp rmp ON rmp.meter_id = cm.meter_id AND rmp.is_delete = '01'
+                WHERE cm.meter_id = ANY(%s)
+                ORDER BY cm.meter_id
+                """,
                 (meter_ids,),
             )
         else:
-            cur.execute("select meter_id, org_no from c_meter order by meter_id")
-        return [(int(meter_id), org_no) for meter_id, org_no in cur.fetchall()]
+            cur.execute(
+                """
+                SELECT cm.meter_id, cm.org_no, rmp.mp_id, rmp.tmnl_id
+                FROM c_meter cm
+                JOIN r_mp rmp ON rmp.meter_id = cm.meter_id AND rmp.is_delete = '01'
+                ORDER BY cm.meter_id
+                """
+            )
+        return [(int(r[0]), r[1], int(r[2]), int(r[3])) for r in cur.fetchall()]
 
 
 def fetch_baseline(conn, table, mp_ids, before_date):
@@ -578,8 +605,8 @@ def main():
     try:
         meters = fetch_meters(conn, meter_ids)
         if not meters:
-            sys.exit("没有匹配到任何 c_meter 记录")
-        mp_ids = [m[0] for m in meters]
+            sys.exit("没有匹配到任何 c_meter 记录（或均无 r_mp is_delete='01' 记录）")
+        mp_ids = [m[2] for m in meters]   # 真实 mp_id，来自 r_mp
 
         n_days = (end - start).days + 1
         print(f"meters={len(meters)} tables={sorted(tables)} range={start}~{end} ({n_days} 天) mode={args.mode}")
@@ -617,23 +644,55 @@ def main():
                 total_written[t] += insert_rows(conn, t, buffers[t], args.mode, args.batch_size)
             buffers[t] = []
 
-        for meter_id, org_no in meters:
-            state = MeterState(meter_id, org_no)
-            for t in ("d_read_curve", "d_read_curve_r", "d_read_curve_v"):
-                apply_baseline(state, baselines.get(t, {}).get(meter_id))
+        def _run_meters(prog, meter_task, day_task):
+            for meter_id, org_no, mp_id, tmnl_id in meters:
+                if prog:
+                    prog.update(meter_task,
+                                description=f"[cyan]mp_id={mp_id}[/cyan] [dim](meter {meter_id})[/dim]")
+                    prog.reset(day_task, total=n_days, completed=0)
 
-            for day in daterange(start, end):
-                for slot_idx in range(SLOTS_PER_DAY):
-                    dt = datetime(day.year, day.month, day.day) + timedelta(minutes=slot_idx * SLOT_MINUTES)
-                    rows = gen_rows_for_slot(state, dt, args.profile_id, tables)
-                    for t, row in rows.items():
-                        buffers[t].append(row)
+                state = MeterState(meter_id, org_no, mp_id, tmnl_id)
+                for t in ("d_read_curve", "d_read_curve_r", "d_read_curve_v"):
+                    apply_baseline(state, baselines.get(t, {}).get(mp_id))
 
-            for t in tables:
-                if len(buffers[t]) >= args.batch_size * 4:
-                    flush(t)
-            conn.commit()
-            print(f"meter {meter_id} done")
+                for di, day in enumerate(daterange(start, end)):
+                    if prog:
+                        prog.update(day_task,
+                                    description=f"[dim]{day}[/dim]",
+                                    completed=di)
+                    for slot_idx in range(SLOTS_PER_DAY):
+                        dt = datetime(day.year, day.month, day.day) + timedelta(minutes=slot_idx * SLOT_MINUTES)
+                        rows = gen_rows_for_slot(state, dt, args.profile_id, tables)
+                        for t, row in rows.items():
+                            buffers[t].append(row)
+
+                for t in tables:
+                    if len(buffers[t]) >= args.batch_size * 4:
+                        flush(t)
+                conn.commit()
+
+                if prog:
+                    prog.update(day_task, completed=n_days)
+                    prog.advance(meter_task)
+
+        if RICH and not sql_file:
+            console = Console()
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("{task.description}"),
+                BarColumn(bar_width=30),
+                MofNCompleteColumn(),
+                TaskProgressColumn(),
+                TimeElapsedColumn(),
+                TimeRemainingColumn(),
+                console=console,
+                transient=False,
+            ) as prog:
+                m_task = prog.add_task(f"[bold]设备[/bold]", total=len(meters))
+                d_task = prog.add_task("[dim]日期[/dim]", total=n_days)
+                _run_meters(prog, m_task, d_task)
+        else:
+            _run_meters(None, None, None)
 
         for t in tables:
             flush(t)
