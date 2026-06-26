@@ -3,11 +3,11 @@
 import os
 
 _DEFAULTS = {
-    "DB_HOST": "localhost",
+    "DB_HOST": "172.17.182.123",
     "DB_PORT": "5432",
-    "DB_NAME": "eco_hes_PHL",
+    "DB_NAME": "eco_ma",
     "DB_USER": "hes",
-    "DB_PASSWORD": "",
+    "DB_PASSWORD": "7L2wYCDWLQdqPr4bNsYBMr5nwutckP8Q",
     "DB_DSN": "",
 }
 
