@@ -518,7 +518,7 @@ def parse_args():
     p.add_argument("--mode", choices=["rebuild", "overwrite", "fill"], default="fill")
     p.add_argument("--meters", help="逗号分隔的 meter_id 列表，默认 c_meter 全部")
     p.add_argument("--tables", help="逗号分隔的表名，默认全部 12 张")
-    p.add_argument("--profile-id", type=int, default=1)
+    p.add_argument("--profile-id", type=int, default=40930000011)
     p.add_argument("--batch-size", type=int, default=2000)
     p.add_argument("--env-file", help="db.env 路径，默认脚本同目录下的 db.env")
     p.add_argument("--dry-run", action="store_true", help="只打印将要生成的行数，不连库写入")
