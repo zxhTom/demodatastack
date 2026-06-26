@@ -555,6 +555,17 @@ def main():
     if args.mode == "rebuild" and not args.dry_run and not args.sql_out and not args.yes:
         sys.exit("rebuild 模式会先删除该时间范围内的现有数据，请加 --yes 确认（或改用 --sql-out 只生成 SQL）")
 
+    if args.dry_run:
+        n_days = (end - start).days + 1
+        n_meters = len(meter_ids) if meter_ids else "?"
+        print(f"meters={n_meters} tables={sorted(tables)} range={start}~{end} ({n_days} 天) mode={args.mode}")
+        if meter_ids:
+            print(f"预计生成行数 = {len(meter_ids)} x {len(tables)} x {n_days} 天 x {SLOTS_PER_DAY} 点"
+                  f" = {len(meter_ids) * len(tables) * n_days * SLOTS_PER_DAY}")
+        else:
+            print(f"预计生成行数 = ?(未指定 --meters，需连库) x {len(tables)} x {n_days} 天 x {SLOTS_PER_DAY} 点")
+        return
+
     dsn = dbconfig.get_dsn(args.env_file)
     conn = psycopg2.connect(dsn)
     conn.autocommit = False
@@ -567,11 +578,6 @@ def main():
 
         n_days = (end - start).days + 1
         print(f"meters={len(meters)} tables={sorted(tables)} range={start}~{end} ({n_days} 天) mode={args.mode}")
-
-        if args.dry_run:
-            print(f"预计生成行数 = {len(meters)} 表 x {len(tables)} x {n_days} 天 x {SLOTS_PER_DAY} 点"
-                  f" = {len(meters) * len(tables) * n_days * SLOTS_PER_DAY}")
-            return
 
         if sql_file:
             print(f"SQL 输出模式：不会直接写库，语句将写入 {args.sql_out}")
