@@ -71,10 +71,10 @@ def _col_date(rng, ts):
 
 # ── 各表行生成函数 ──────────────────────────────────────────────────────────
 
-def _gen_alarm_event(rng, meter_id, ts):
+def _gen_alarm_event(rng, mp_id, ts):
     # content_id 由 seq_content_id 序列自动生成，不插入
     return {
-        "device_id":    meter_id,
+        "device_id":    mp_id,
         "device_type":  rng.choice(_DEVICE_TYPES),
         "data_date":    ts,
         "register_no":  str(rng.randint(1, 200)),
@@ -88,9 +88,9 @@ def _gen_alarm_event(rng, meter_id, ts):
     }
 
 
-def _gen_base(rng, meter_id, ec, ts, seq):
+def _gen_base(rng, mp_id, ec, ts, seq):
     return {
-        "mp_id":          meter_id,
+        "mp_id":          mp_id,
         "event_code":     ec[0],
         "sub_event_code": ec[1],
         "data_date":      ts.date(),
@@ -163,22 +163,22 @@ def build_rows(table, meters, count, start_dt, end_dt, seed):
 
     while len(rows) < count and attempts < max_attempts:
         attempts += 1
-        meter_id = rng.choice(meters)
+        mp_id = rng.choice(meters)
         ts = _rand_ts(rng, start_dt, end_dt)
         seq = rng.randint(1, 9999)
 
         if table == "d_alarm_event":
-            rows.append(_gen_alarm_event(rng, meter_id, ts))
+            rows.append(_gen_alarm_event(rng, mp_id, ts))
             continue
 
         ec = rng.choice(_EC[table])
         gen = _GENERATORS[table]
-        row = gen(rng, meter_id, ec, ts, seq)
+        row = gen(rng, mp_id, ec, ts, seq)
 
         if table == "d_config_modification_event_log":
-            pk = (meter_id, ts.date(), ts)
+            pk = (mp_id, ts.date(), ts)
         else:
-            pk = (meter_id, ec[0], ec[1], ts.date(), ts)
+            pk = (mp_id, ec[0], ec[1], ts.date(), ts)
 
         if pk in seen_pks:
             continue
@@ -191,14 +191,28 @@ def build_rows(table, meters, count, start_dt, end_dt, seed):
 
 
 def fetch_meters(conn, meter_ids):
+    """通过 r_mp(is_delete='01') 获取真实 mp_id，无有效 r_mp 记录的 meter 自动跳过。"""
     with conn.cursor() as cur:
         if meter_ids:
             cur.execute(
-                "SELECT meter_id FROM c_meter WHERE meter_id = ANY(%s) ORDER BY meter_id",
+                """
+                SELECT rmp.mp_id
+                FROM c_meter cm
+                JOIN r_mp rmp ON rmp.meter_id = cm.meter_id AND rmp.is_delete = '01'
+                WHERE cm.meter_id = ANY(%s)
+                ORDER BY rmp.mp_id
+                """,
                 (meter_ids,),
             )
         else:
-            cur.execute("SELECT meter_id FROM c_meter ORDER BY meter_id")
+            cur.execute(
+                """
+                SELECT rmp.mp_id
+                FROM c_meter cm
+                JOIN r_mp rmp ON rmp.meter_id = cm.meter_id AND rmp.is_delete = '01'
+                ORDER BY rmp.mp_id
+                """
+            )
         return [int(r[0]) for r in cur.fetchall()]
 
 
