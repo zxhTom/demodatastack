@@ -88,21 +88,49 @@ def count_rows(conn, table, start, end):
 
 
 def fix_chunk(conn, table, chunk_start, chunk_end):
-    """识别：t.mp_id == meter_id（非真实 mp_id），用 r_mp 修正三个字段。"""
-    sql = f"""
-        UPDATE {table} t
-        SET    mp_id      = rmp.mp_id,
-               tmnl_id   = rmp.tmnl_id,
-               profile_id = {NEW_PROFILE_ID}
+    """识别：t.mp_id == meter_id（非真实 mp_id），用 r_mp 修正三个字段。
+
+    两步处理主键冲突：
+      1. DELETE 已有正确数据的冲突行（错误行是冗余的，直接丢弃）
+      2. UPDATE 剩余错误行（此时不会再有冲突）
+    """
+    # 公共 WHERE 条件
+    wrong_cond = f"""
         FROM   r_mp rmp
         WHERE  rmp.meter_id = t.mp_id
           AND  rmp.is_delete = '01'
           AND  rmp.mp_id    != t.mp_id
           AND  t.data_date BETWEEN %s AND %s
     """
+    # 冲突判断：正确 mp_id 在同一 (data_date, data_time) 已有行
+    conflict_exists = f"""
+        EXISTS (
+            SELECT 1 FROM {table} e
+            WHERE  e.mp_id     = rmp.mp_id
+              AND  e.data_date = t.data_date
+              AND  e.data_time = t.data_time
+        )
+    """
+    params = (chunk_start, chunk_end)
+    deleted = updated = 0
     with conn.cursor() as cur:
-        cur.execute(sql, (chunk_start, chunk_end))
-        return cur.rowcount
+        cur.execute(
+            f"DELETE FROM {table} t {wrong_cond} AND {conflict_exists}",
+            params,
+        )
+        deleted = cur.rowcount
+        cur.execute(
+            f"""
+            UPDATE {table} t
+            SET    mp_id      = rmp.mp_id,
+                   tmnl_id   = rmp.tmnl_id,
+                   profile_id = {NEW_PROFILE_ID}
+            {wrong_cond}
+            """,
+            params,
+        )
+        updated = cur.rowcount
+    return deleted + updated
 
 
 def daterange_chunks(start, end, days):
