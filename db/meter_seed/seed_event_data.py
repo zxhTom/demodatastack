@@ -262,8 +262,10 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--start", required=True, help="开始日期 YYYY-MM-DD")
     p.add_argument("--end",   required=True, help="结束日期 YYYY-MM-DD（含）")
-    p.add_argument("--count", type=int, default=1000,
-                   help="每张表生成的条数（默认 1000）")
+    p.add_argument("--count", type=int, default=None,
+                   help="每张表生成的总条数")
+    p.add_argument("--count-per-day", type=int, default=None,
+                   help="每张表每天生成的条数，与时间范围联动（和 --count 二选一，默认 10）")
     p.add_argument("--tables", help="逗号分隔的表名，默认全部 10 张")
     p.add_argument("--meters", help="逗号分隔的 meter_id，默认 c_meter 全部")
     p.add_argument("--batch-size", type=int, default=500)
@@ -279,6 +281,16 @@ def main():
     args = parse_args()
     start_dt = datetime.fromisoformat(args.start)
     end_dt   = datetime.fromisoformat(args.end) + timedelta(days=1)
+    n_days   = (end_dt - start_dt).days
+
+    if args.count is not None and args.count_per_day is not None:
+        sys.exit("--count 和 --count-per-day 不能同时使用")
+    if args.count is not None:
+        count = args.count
+    elif args.count_per_day is not None:
+        count = args.count_per_day * n_days
+    else:
+        count = 10 * n_days  # 默认每天 10 条
 
     tables = set(args.tables.split(",")) if args.tables else set(ALL_TABLES)
     unknown = tables - set(ALL_TABLES)
@@ -290,8 +302,8 @@ def main():
     if args.dry_run:
         n_meters = len(meter_ids) if meter_ids else "?"
         print(f"tables={sorted(tables)}")
-        print(f"range={args.start}~{args.end}  count={args.count}/表  meters={n_meters}")
-        print(f"预计总行数 = {len(tables)} x {args.count} = {len(tables) * args.count}")
+        print(f"range={args.start}~{args.end} ({n_days}天)  count={count}/表  meters={n_meters}")
+        print(f"预计总行数 = {len(tables)} x {count} = {len(tables) * count}")
         return
 
     dsn = dbconfig.get_dsn(args.env_file)
@@ -302,7 +314,7 @@ def main():
         meters = fetch_meters(conn, meter_ids)
         if not meters:
             sys.exit("没有匹配到任何 c_meter 记录")
-        print(f"meters={len(meters)}  range={args.start}~{args.end}  count={args.count}/表  seed={args.seed}")
+        print(f"meters={len(meters)}  range={args.start}~{args.end} ({n_days}天)  count={count}/表  seed={args.seed}")
         if sql_file:
             print(f"SQL 输出模式：语句将写入 {args.sql_out}")
 
@@ -314,7 +326,7 @@ def main():
                     prog.update(tbl_task,
                                 description=f"[cyan]{table}[/cyan]",
                                 completed=ti)
-                rows = build_rows(table, meters, args.count, start_dt, end_dt, args.seed)
+                rows = build_rows(table, meters, count, start_dt, end_dt, args.seed)
                 if sql_file:
                     for stmt in mogrify_rows(conn, table, rows, args.batch_size):
                         sql_file.write(stmt + "\n")

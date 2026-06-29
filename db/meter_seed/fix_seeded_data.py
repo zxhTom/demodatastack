@@ -93,17 +93,16 @@ def fix_chunk(conn, table, chunk_start, chunk_end):
     两步处理主键冲突：
       1. DELETE 已有正确数据的冲突行（错误行是冗余的，直接丢弃）
       2. UPDATE 剩余错误行（此时不会再有冲突）
+    注意：DELETE 用 USING 引入关联表，UPDATE 用 FROM，语法不同。
     """
-    # 公共 WHERE 条件
-    wrong_cond = f"""
-        FROM   r_mp rmp
-        WHERE  rmp.meter_id = t.mp_id
-          AND  rmp.is_delete = '01'
-          AND  rmp.mp_id    != t.mp_id
-          AND  t.data_date BETWEEN %s AND %s
+    # 公共 WHERE 条件（不含 JOIN 子句）
+    where = """
+        rmp.meter_id = t.mp_id
+        AND rmp.is_delete = '01'
+        AND rmp.mp_id != t.mp_id
+        AND t.data_date BETWEEN %s AND %s
     """
-    # 冲突判断：正确 mp_id 在同一 (data_date, data_time) 已有行
-    conflict_exists = f"""
+    conflict = f"""
         EXISTS (
             SELECT 1 FROM {table} e
             WHERE  e.mp_id     = rmp.mp_id
@@ -114,18 +113,26 @@ def fix_chunk(conn, table, chunk_start, chunk_end):
     params = (chunk_start, chunk_end)
     deleted = updated = 0
     with conn.cursor() as cur:
+        # DELETE 用 USING
         cur.execute(
-            f"DELETE FROM {table} t {wrong_cond} AND {conflict_exists}",
+            f"""
+            DELETE FROM {table} t
+            USING  r_mp rmp
+            WHERE  {where}
+              AND  {conflict}
+            """,
             params,
         )
         deleted = cur.rowcount
+        # UPDATE 用 FROM
         cur.execute(
             f"""
             UPDATE {table} t
             SET    mp_id      = rmp.mp_id,
                    tmnl_id   = rmp.tmnl_id,
                    profile_id = {NEW_PROFILE_ID}
-            {wrong_cond}
+            FROM   r_mp rmp
+            WHERE  {where}
             """,
             params,
         )
