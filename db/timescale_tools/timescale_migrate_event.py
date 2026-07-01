@@ -66,11 +66,14 @@ ALL_TABLES = EVENT_TABLES + CURVE_TABLES + LOG_TABLES
 # ── 检查是否已是超表 ─────────────────────────────────────────────────────────
 
 def is_hypertable(conn, table):
+    """用官方 view 判断，避免 _timescaledb_catalog 残留记录导致误判。"""
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT COUNT(*) FROM _timescaledb_catalog.hypertable
-            WHERE table_name = %s AND schema_name = 'public'
+            SELECT COUNT(*)
+            FROM timescaledb_information.hypertables
+            WHERE hypertable_schema = 'public'
+              AND hypertable_name   = %s
             """,
             (table,),
         )
