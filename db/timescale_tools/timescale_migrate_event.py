@@ -113,6 +113,40 @@ def is_partitioned(conn, table):
         return row is not None and row[0] == 'p'
 
 
+# ── 唯一索引冲突预处理 ──────────────────────────────────────────────────────
+
+def drop_conflicting_unique_indexes(conn, table, time_col, verbose):
+    """DROP 不含 time_col 的唯一索引（TimescaleDB 要求唯一索引必须包含分区列）。
+    返回被删除的索引名列表，便于日志记录。
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT i.relname AS idx_name, pg_get_indexdef(i.oid) AS idx_def
+            FROM pg_index ix
+            JOIN pg_class t  ON t.oid  = ix.indrelid
+            JOIN pg_class i  ON i.oid  = ix.indexrelid
+            JOIN pg_namespace n ON n.oid = t.relnamespace
+            WHERE n.nspname = 'public'
+              AND t.relname  = %s
+              AND ix.indisunique = true
+              AND ix.indisprimary = false
+            """,
+            (table,),
+        )
+        rows = cur.fetchall()
+
+    to_drop = [name for name, defn in rows if time_col not in defn]
+    for idx_name in to_drop:
+        sql = f'DROP INDEX "{idx_name}";'
+        if verbose:
+            print(f"    SQL: {sql}")
+        with conn.cursor() as cur:
+            cur.execute(sql)
+        print(f"    ✓ DROP 唯一索引 {idx_name}（不含 {time_col}，与 TimescaleDB 不兼容）")
+    return to_drop
+
+
 # ── 分区表迁移 ───────────────────────────────────────────────────────────────
 
 def migrate_partitioned_table(conn, table, time_col, chunk_interval, segmentby, compress_after, dry_run, verbose):
@@ -244,6 +278,11 @@ def convert_table(conn, table, time_col, chunk_interval, segmentby, compress_aft
         return migrate_partitioned_table(
             conn, table, time_col, chunk_interval, segmentby, compress_after, dry_run, verbose
         )
+
+    if not dry_run:
+        dropped = drop_conflicting_unique_indexes(conn, table, time_col, verbose)
+        if dropped:
+            conn.commit()
 
     stmts = [
         (
