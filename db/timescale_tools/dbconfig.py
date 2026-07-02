@@ -12,11 +12,11 @@ import os
 
 # 内置默认值（与 docker-compose.yml 中的 timescaledb 一致，仅供本地演示）
 _DEFAULTS = {
-    "DB_HOST": "localhost",
+    "DB_HOST": "172.17.182.123",
     "DB_PORT": "5432",
-    "DB_NAME": "edumanage",
-    "DB_USER": "postgres",
-    "DB_PASSWORD": "postgres123",
+    "DB_NAME": "eco_ma",
+    "DB_USER": "hes",
+    "DB_PASSWORD": "7L2wYCDWLQdqPr4bNsYBMr5nwutckP8Q",
     "DB_DSN": "",
 }
 
