@@ -302,17 +302,18 @@ time_column = start_time
 pk_columns  = comm_log_id, start_time
 ```
 
-配了 `pk_columns` 后，`to-hyper` 会自动：新表建好后先删掉从原表继承来的主键约束，
-再按 `pk_columns` 重建一个包含分区列的复合主键，然后才调用 `create_hypertable`。
-`status` 命令也会对每张**普通表**做同样的诊断，配置不对会在转换前就提示你：
+配了 `pk_columns` 后，`to-hyper` 会跳过原主键的定义（列结构不同，没法照抄），
+改成按 `pk_columns` 建一个包含分区列的复合主键——但**沿用原主键的名字**（细节见
+§9.9），然后才调用 `create_hypertable`。`status` 命令也会对每张**普通表**做同样的
+诊断，配置不对会在转换前就提示你：
 
 ```
 ✗ 当前主键 (comm_log_id) 不含分区列 start_time，需要在 tables.ini 给这张表加
   pk_columns = ...（须包含 start_time）
 ```
 
-`to-plain`（转回普通表）不需要关心这个——它直接 `LIKE` 现有超表的结构，超表上
-已经是重建好的复合主键，转回普通表会原样保留（不会恢复成最初的单列主键，但
+`to-plain`（转回普通表）不需要关心这个——超表上已经是 `pk_columns` 重建好的
+复合主键，转回普通表会原样保留（不会恢复成最初的单列主键，但主键名字不变、
 业务上依然是唯一约束，不影响使用）。
 
 ### 9.4 常用命令
@@ -498,3 +499,73 @@ python3 find_leftover_tables.py --env-file prod.env --out cleanup_candidates.sql
 > 是这个项目的核心 schema 的一部分，删了会破坏项目自带的基准测试功能。
 > 这不是针对你的 `eco_ma` 库的结论（那边根本没有这张表），只是提醒你：
 > ④ 类命中的表，务必自己确认一下这张表的真实来历，别看到 `_ts` 结尾就当备份删。
+
+---
+
+## 11. 转换前后索引名保证一致
+
+### 11.1 为什么需要专门处理
+
+PostgreSQL 的 `CREATE TABLE tmp (LIKE src INCLUDING INDEXES)`（以及连带 `INCLUDING
+CONSTRAINTS` 建出来的 PK/UNIQUE 约束）**不会保留原索引名**，会按新表名重新生成一套
+默认命名。比如原表 `idx_alarm_event_device` 这个索引，转换后会变成类似
+`d_alarm_event_ts_new_device_id_idx` 这种自动生成的名字——哪怕两张表的列结构、
+数据完全一样，索引名也对不上了。这是 PostgreSQL 的标准行为，不是这个工具引入的，
+但转换脚本如果直接用 `LIKE ... INCLUDING ALL`（`table_convert.py` 早期版本确实
+这么写的）就会中招。（实测验证过：`CHECK` 约束不受影响，会正确保留原名，只有
+独立索引和 PK/UNIQUE 约束会被改名。）
+
+### 11.2 现在是怎么保证的
+
+`table_convert.py` **不再用** `LIKE ... INCLUDING INDEXES/CONSTRAINTS`，改成：
+
+1. 建新表时只拷列结构（`INCLUDING DEFAULTS INCLUDING GENERATED INCLUDING STORAGE
+   INCLUDING COMMENTS`），不含索引和约束
+2. `create_hypertable` 传 `create_default_indexes => false`，不让 TimescaleDB
+   自动加一个原表没有的时间列索引
+3. 转换前先读出原表所有独立索引和 PK/UNIQUE 约束的**完整定义**
+   （`pg_get_indexdef`/`pg_get_constraintdef`，唯一性、部分索引的 `WHERE` 条件、
+   表达式索引都完整保留）
+4. 原表改名成备份表后，**先把备份表上那些同名的索引/约束也改名让路**（改名不会
+   影响它们的功能，只是空出名字），再在新表上用原名重建
+5. `pk_columns` 强制重建主键的情况：新主键的列结构必然和原来不同（多了分区列），
+   没法照抄原定义，但**沿用原主键的名字**
+
+结果是：只要不用 `--redo`，转换前后**索引名、约束名逐一对应，一个不多一个不少**
+（`create_default_indexes => false` 保证了这一点——没有 §11.1 那种"多出一个原表
+没有的索引"的情况）。
+
+### 11.3 `--redo` 的名字是从哪来的
+
+`--redo` 是从冻结的备份表（`_pg_old`/`_ts_old`）重新构建，而备份表上的索引/约束
+在它成为备份的那一刻已经被改名让路过（比如 `pk_idx_conv_custom` 会变成
+`pk_idx_conv_custom_pgold`）。如果直接照抄备份表**此刻**的名字，会：既对不上
+用户原本的真实名字，又会跟备份表自己身上还留着的同名对象在连接层面撞名——这两个
+问题都是实测跑出来的真实 bug，不是理论推测。
+
+修复方式：从备份表读取定义时，会按照当初改名用的后缀（`_pgold`/`_tsold`）把名字
+**还原**回真实原名，再重建。这只对**用本工具当前版本**转换产生的备份表有效——
+如果某张表是用更早版本的 `table_convert.py`、或者 `convert_to_timescale.py`/
+`timescale_migrate_event.py`/`transtable.py` 这些旧脚本转换的，它的备份表上索引名
+本来就已经是自动生成的乱码名字（§11.1 那种），不含"真实原名"这个信息，重新读出来
+再重建也没法凭空恢复出用户最初取的名字——这种情况下 `--redo` 会照抄备份表上现有
+的（可能已经是乱码的）名字，而不是报错，请知悉这个限制。
+
+**你的 `eco_ma` 库还没有用本工具转换过任何真实表**，所以从现在开始转换，索引名
+保证问题从一开始就不会发生。
+
+### 11.4 已验证的场景
+
+用一张同时有自定义命名的 PK、普通索引、唯一索引、部分索引（带 `WHERE` 条件）的
+测试表，验证过以下全部场景转换前后索引名/定义完全一致：
+
+- `to-hyper`（普通 → 超表）：4 个索引/约束名字、唯一性、`WHERE` 条件全部一致，
+  且没有 TimescaleDB 自动加的多余索引
+- `to-plain`（超表 → 普通表）：同上
+- `to-hyper --redo`：从 `_pg_old` 重新迁移，正确还原出真实原名（不是备份表上
+  临时改过的后缀名）
+- `to-plain --redo`：从 `_ts_old` 重新转换，同上
+- 同一张表反复 `to-hyper` → `to-plain` 来回转换、两个备份表同时存在的情况下，
+  改名让路不再互相撞名（这也是实测跑出来才发现并修的 bug：早期版本两个方向用
+  同一个改名后缀，反复转换会导致新一轮转换在改名让路这一步失败，事务会正确回滚、
+  不丢数据，但会中断）

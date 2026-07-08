@@ -32,6 +32,7 @@ import argparse
 import configparser
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -182,16 +183,6 @@ def pk_columns_of(conn, table):
     return rows or None
 
 
-def pk_constraint_name(conn, table):
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT conname FROM pg_constraint WHERE conrelid=%s::regclass AND contype='p';",
-            (table,),
-        )
-        row = cur.fetchone()
-    return row[0] if row else None
-
-
 def compression_enabled(conn, table):
     try:
         with conn.cursor() as cur:
@@ -261,26 +252,135 @@ def _print_dry_steps(steps):
         print(f"    -- {line}")
 
 
+# ── 索引/约束原名保留 ──────────────────────────────────────────────────────────
+# CREATE TABLE ... (LIKE src INCLUDING INDEXES/CONSTRAINTS) 不会保留原索引名和
+# 原 PK/UNIQUE 约束名，会按新表名重新生成一套（比如 idx_alarm_device 会变成
+# xxx_ts_new_device_id_idx）。CHECK 约束名不受影响，只有独立索引和 PK/UNIQUE
+# 约束（连带它们背后的索引）会被改名。所以这里不用 INCLUDING INDEXES/CONSTRAINTS，
+# 改成显式读取原表的索引/约束定义，改名阶段按原名重建，保证转换前后索引名一致。
+
+def get_index_and_constraint_defs(conn, table, strip_suffix=None):
+    """返回 (constraints, indexes)：
+    constraints = [(conname, contype, condef), ...]  # PK/UNIQUE/EXCLUDE（含 CHECK 之外的命名约束）
+    indexes = [(indexname, indexdef), ...]  # 不背靠约束的独立索引
+    CHECK 约束不在这里处理——LIKE INCLUDING CONSTRAINTS 本来就会正确保留它的原名。
+
+    strip_suffix：从 _pg_old/_ts_old 备份表读取（--redo 场景）时必须传。备份表上的
+    约束/索引名此刻是 rename_away_conflicting 改过的带后缀名（比如
+    pk_xxx_pgold），不是真正的原名——如果原样拿去在新表上重建，会既对不上用户
+    原来的名字，又会跟备份表自己身上还留着的同名对象连接层面撞名（实测复现过）。
+    这里按已知后缀把名字和 indexdef 里嵌入的名字都还原回真正的原名。
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT conname, contype, pg_get_constraintdef(oid) "
+            "FROM pg_constraint WHERE conrelid=%s::regclass AND contype IN ('p','u','x');",
+            (table,),
+        )
+        raw_constraints = cur.fetchall()
+        backed_names = {c[0] for c in raw_constraints}
+        cur.execute(
+            "SELECT indexname, indexdef FROM pg_indexes "
+            "WHERE schemaname='public' AND tablename=%s;",
+            (table,),
+        )
+        raw_indexes = [(n, d) for n, d in cur.fetchall() if n not in backed_names]
+
+    def _strip(name):
+        if strip_suffix and name.endswith(strip_suffix):
+            return name[: -len(strip_suffix)]
+        return name
+
+    constraints = [(_strip(conname), contype, condef) for conname, contype, condef in raw_constraints]
+
+    indexes = []
+    for indexname, indexdef in raw_indexes:
+        real_name = _strip(indexname)
+        if real_name != indexname:
+            indexdef = re.sub(rf'\bINDEX\s+{re.escape(indexname)}\b', f'INDEX {real_name}', indexdef, count=1)
+        indexes.append((real_name, indexdef))
+
+    return constraints, indexes
+
+
+def _safe_suffixed(name, suffix):
+    """PG 标识符最长 63 字节，加后缀超长就从中间截断，避免改名时报错。"""
+    max_len = 63
+    if len(name) + len(suffix) <= max_len:
+        return name + suffix
+    return name[: max_len - len(suffix)] + suffix
+
+
+def _retarget_indexdef(indexdef, new_table):
+    """indexdef 形如 'CREATE [UNIQUE] INDEX 名字 ON public.表名 USING ...'，
+    只替换 ON 子句里的表名，索引名和其余定义原样保留。"""
+    return re.sub(r'\bON\s+public\.\w+', f'ON "{new_table}"', indexdef, count=1)
+
+
+def rename_away_conflicting(conn, table, constraints, indexes, verbose, tag):
+    """table 是刚被改名成备份的旧表：它身上的约束/索引还叫原名（改表名不会
+    连带改约束/索引名），这里给它们改名让路，腾出原名给新表按原名重建。
+    改约束名会自动连带把背后的索引也一起改名（PG 行为），不用单独处理。
+
+    tag 必须是调用方专属的后缀（比如 to-hyper 用 "pgold"、to-plain 用 "tsold"），
+    不能用一个固定后缀——同一张表在 to-hyper/to-plain 之间来回转换时，_pg_old
+    和 _ts_old 两个备份表会先后各自尝试"腾出同一个原名"，如果两边用同一个后缀，
+    第二次转换时会撞上第一次转换留下的、还没清理的同名对象（实测复现过这个问题）。
+    """
+    suffix = f"_{tag}"
+    for conname, _, _ in constraints:
+        new_name = _safe_suffixed(conname, suffix)
+        _exec(conn, f"备份表上的约束 {conname} 改名让路 → {new_name}",
+              f'ALTER TABLE "{table}" RENAME CONSTRAINT "{conname}" TO "{new_name}";', verbose)
+    for indexname, _ in indexes:
+        new_name = _safe_suffixed(indexname, suffix)
+        _exec(conn, f"备份表上的索引 {indexname} 改名让路 → {new_name}",
+              f'ALTER INDEX "{indexname}" RENAME TO "{new_name}";', verbose)
+
+
+def apply_indexes_and_constraints(conn, table, constraints, indexes, verbose,
+                                  pk_columns=None, time_column=None):
+    """在 table（改名后重新上位的新表）上按原名重建约束和独立索引。
+    传了 pk_columns 时，原主键定义会被跳过，改用 pk_columns 的列重建
+    （原主键列结构不含分区列，不能照抄），但如果原来有主键，沿用它的原名。
+    to-plain 方向不需要重建主键，直接不传 pk_columns 即可（原样照抄所有约束）。
+    """
+    old_pk_name = next((c for c, t, _ in constraints if t == 'p'), None)
+    for conname, contype, condef in constraints:
+        if contype == 'p' and pk_columns:
+            continue  # 用下面 pk_columns 重建的复合主键代替，列结构不同，不能照抄原定义
+        _exec(conn, f"重建约束 {conname}",
+              f'ALTER TABLE "{table}" ADD CONSTRAINT "{conname}" {condef};', verbose)
+
+    if pk_columns:
+        pk_name = old_pk_name or f"{table}_pkey"
+        note = f"，沿用原主键名 {pk_name}" if old_pk_name else ""
+        _exec(conn, f"重建主键 ({', '.join(pk_columns)})，纳入分区列 {time_column}{note}",
+              f'ALTER TABLE "{table}" ADD CONSTRAINT "{pk_name}" '
+              f'PRIMARY KEY ({", ".join(pk_columns)});', verbose)
+
+    for indexname, indexdef in indexes:
+        stmt = _retarget_indexdef(indexdef, table)
+        _exec(conn, f"重建索引 {indexname}", stmt, verbose)
+
+
 # ── to-hyper：普通表 -> 超表 ──────────────────────────────────────────────────
 
 def _build_hypertable(conn, tmp, src, cfg, verbose):
     time_col = cfg["time_column"]
     _exec(conn, "清理残留临时表", f'DROP TABLE IF EXISTS "{tmp}";', verbose)
-    _exec(conn, f"从 {src} 创建新普通表 {tmp}（含完整结构）",
-          f'CREATE TABLE "{tmp}" (LIKE "{src}" INCLUDING ALL);', verbose)
-
-    if cfg["pk_columns"]:
-        tmp_pk = pk_constraint_name(conn, tmp)
-        if tmp_pk:
-            _exec(conn, f"删除继承来的主键 {tmp_pk}",
-                  f'ALTER TABLE "{tmp}" DROP CONSTRAINT "{tmp_pk}";', verbose)
-        _exec(conn, f"重建主键 ({', '.join(cfg['pk_columns'])})，纳入分区列 {time_col}",
-              f'ALTER TABLE "{tmp}" ADD PRIMARY KEY ({", ".join(cfg["pk_columns"])});', verbose)
+    _exec(conn, f"从 {src} 创建新表 {tmp}（仅列结构，索引/约束改名让路后按原名重建）",
+          f'CREATE TABLE "{tmp}" (LIKE "{src}" '
+          f'INCLUDING DEFAULTS INCLUDING GENERATED INCLUDING STORAGE INCLUDING COMMENTS);', verbose)
 
     _exec(conn, f"create_hypertable({tmp}, {time_col}, chunk={cfg['chunk_interval']})",
           f"SELECT create_hypertable('public.{tmp}', "
           f"by_range('{time_col}', INTERVAL '{cfg['chunk_interval']}'), "
-          f"migrate_data => false, if_not_exists => true);", verbose)
+          f"migrate_data => false, if_not_exists => true, "
+          # 不让 TimescaleDB 自动加一个默认的时间列索引——原表有没有这个索引由
+          # 我们自己按原样重建（下面 apply_indexes_and_constraints），自动加的话
+          # 会多出一个原表没有的索引，破坏"索引集合和原表完全一致"的保证。
+          f"create_default_indexes => false);", verbose)
 
     if cfg["segmentby"]:
         orderby = cfg["orderby"] or f"{time_col} DESC"
@@ -320,6 +420,12 @@ def to_hyper_one(conn, table, cfg, redo, dry_run, verbose):
     if not hyper and is_partitioned(conn, table):
         print(f"  [跳过]  {table}: 是 PG 原生分区表（暂不支持，需要另行处理）")
         return "skip"
+    if not hyper and table_exists(conn, bak):
+        # --redo 只在"现在就是超表"时才有意义（从 _pg_old 重新迁移）；现在已经是
+        # 普通表的话 --redo 不适用，会走下面的普通迁移路径，同样需要这个校验，
+        # 不能因为传了 --redo 就放过（这里曾经错误地放过，实测复现过这个 bug）。
+        print(f"  [错误]  {table}: 备份名 {bak} 已被占用，请先处理（重命名或 DROP）后重试")
+        return "error"
 
     src = bak if (hyper and redo) else table
     current_pk = pk_columns_of(conn, src)
@@ -334,12 +440,8 @@ def to_hyper_one(conn, table, cfg, redo, dry_run, verbose):
     if dry_run:
         steps = [
             f'DROP TABLE IF EXISTS "{tmp}";',
-            f'CREATE TABLE "{tmp}" (LIKE "{src}" INCLUDING ALL);',
-        ]
-        if cfg["pk_columns"]:
-            steps += [f'ALTER TABLE "{tmp}" DROP CONSTRAINT <继承来的主键>;',
-                      f'ALTER TABLE "{tmp}" ADD PRIMARY KEY ({", ".join(cfg["pk_columns"])});']
-        steps += [
+            f'CREATE TABLE "{tmp}" (LIKE "{src}" INCLUDING DEFAULTS INCLUDING GENERATED '
+            f'INCLUDING STORAGE INCLUDING COMMENTS);  -- 不含索引/约束',
             f"SELECT create_hypertable('public.{tmp}', by_range('{cfg['time_column']}', "
             f"INTERVAL '{cfg['chunk_interval']}'), ...);",
         ]
@@ -351,13 +453,20 @@ def to_hyper_one(conn, table, cfg, redo, dry_run, verbose):
             '-- 行数校验：count(src) == count(tmp)，不一致则中止',
         ]
         if hyper and redo:
-            steps += [f'DROP TABLE "{table}";  -- 删除当前（错误的）超表', f'ALTER TABLE "{tmp}" RENAME TO "{table}";']
+            steps += [f'DROP TABLE "{table}";  -- 删除当前（错误的）超表',
+                      '-- 按原名重建索引/约束（PK 用 pk_columns 重建，其余照抄原定义）',
+                      f'ALTER TABLE "{tmp}" RENAME TO "{table}";']
         else:
-            steps += [f'ALTER TABLE "{table}" RENAME TO "{bak}";', f'ALTER TABLE "{tmp}" RENAME TO "{table}";']
+            steps += [f'ALTER TABLE "{table}" RENAME TO "{bak}";',
+                      '-- 备份表上的索引/约束改名让路（原名腾给新表）',
+                      '-- 按原名重建索引/约束（PK 用 pk_columns 重建，其余照抄原定义）',
+                      f'ALTER TABLE "{tmp}" RENAME TO "{table}";']
         _print_dry_steps(steps)
         return "ok"
 
     try:
+        strip_suffix = "_pgold" if (hyper and redo) else None
+        constraints, indexes = get_index_and_constraint_defs(conn, src, strip_suffix=strip_suffix)
         _build_hypertable(conn, tmp, src, cfg, verbose)
 
         src_n = count_rows(conn, src)
@@ -374,10 +483,17 @@ def to_hyper_one(conn, table, cfg, redo, dry_run, verbose):
             owned_seqs = detach_owned_sequences(conn, table, verbose)
             with conn.cursor() as cur:
                 cur.execute(f'DROP TABLE "{table}";')
+            apply_indexes_and_constraints(conn, tmp, constraints, indexes, verbose,
+                                          pk_columns=cfg["pk_columns"], time_column=cfg["time_column"])
+            with conn.cursor() as cur:
                 cur.execute(f'ALTER TABLE "{tmp}" RENAME TO "{table}";')
         else:
             with conn.cursor() as cur:
                 cur.execute(f'ALTER TABLE "{table}" RENAME TO "{bak}";')
+            rename_away_conflicting(conn, bak, constraints, indexes, verbose, tag="pgold")
+            apply_indexes_and_constraints(conn, tmp, constraints, indexes, verbose,
+                                          pk_columns=cfg["pk_columns"], time_column=cfg["time_column"])
+            with conn.cursor() as cur:
                 cur.execute(f'ALTER TABLE "{tmp}" RENAME TO "{table}";')
         conn.commit()
         note = f"（备份 {bak} 保留不动）" if (hyper and redo) else f"（原表备份为 {bak}）"
@@ -495,22 +611,30 @@ def to_plain_one(conn, table, redo, dry_run, verbose):
     if dry_run:
         steps = [
             f'DROP TABLE IF EXISTS "{tmp}";',
-            f'CREATE TABLE "{tmp}" (LIKE "{src}" INCLUDING ALL);',
+            f'CREATE TABLE "{tmp}" (LIKE "{src}" INCLUDING DEFAULTS INCLUDING GENERATED '
+            f'INCLUDING STORAGE INCLUDING COMMENTS);  -- 不含索引/约束',
             f'INSERT INTO "{tmp}" SELECT * FROM "{src}";  -- 压缩数据透明解压',
             '-- 行数校验：count(src) == count(tmp)，不一致则中止',
         ]
         if plain_already and redo:
             steps += [f'DROP TABLE "{table}";  -- 丢弃当前普通表（用 {bak} 的内容取代）',
+                      '-- 按原名重建索引/约束',
                       f'ALTER TABLE "{tmp}" RENAME TO "{table}";']
         else:
-            steps += [f'ALTER TABLE "{table}" RENAME TO "{bak}";', f'ALTER TABLE "{tmp}" RENAME TO "{table}";']
+            steps += [f'ALTER TABLE "{table}" RENAME TO "{bak}";',
+                      '-- 备份表上的索引/约束改名让路（原名腾给新表）',
+                      '-- 按原名重建索引/约束',
+                      f'ALTER TABLE "{tmp}" RENAME TO "{table}";']
         _print_dry_steps(steps)
         return "ok"
 
     try:
+        strip_suffix = "_tsold" if (plain_already and redo) else None
+        constraints, indexes = get_index_and_constraint_defs(conn, src, strip_suffix=strip_suffix)
         _exec(conn, "清理残留临时表", f'DROP TABLE IF EXISTS "{tmp}";', verbose)
-        _exec(conn, f"从 {src} 创建普通表 {tmp}",
-              f'CREATE TABLE "{tmp}" (LIKE "{src}" INCLUDING ALL);', verbose)
+        _exec(conn, f"从 {src} 创建普通表 {tmp}（仅列结构，索引/约束改名让路后按原名重建）",
+              f'CREATE TABLE "{tmp}" (LIKE "{src}" '
+              f'INCLUDING DEFAULTS INCLUDING GENERATED INCLUDING STORAGE INCLUDING COMMENTS);', verbose)
 
         print(f"    复制数据 {src} → {tmp}（全量，压缩 chunk 自动解压，可能较慢）…", flush=True)
         with conn.cursor() as cur:
@@ -532,10 +656,15 @@ def to_plain_one(conn, table, redo, dry_run, verbose):
             owned_seqs = detach_owned_sequences(conn, table, verbose)
             with conn.cursor() as cur:
                 cur.execute(f'DROP TABLE "{table}";')
+            apply_indexes_and_constraints(conn, tmp, constraints, indexes, verbose)
+            with conn.cursor() as cur:
                 cur.execute(f'ALTER TABLE "{tmp}" RENAME TO "{table}";')
         else:
             with conn.cursor() as cur:
                 cur.execute(f'ALTER TABLE "{table}" RENAME TO "{bak}";')
+            rename_away_conflicting(conn, bak, constraints, indexes, verbose, tag="tsold")
+            apply_indexes_and_constraints(conn, tmp, constraints, indexes, verbose)
+            with conn.cursor() as cur:
                 cur.execute(f'ALTER TABLE "{tmp}" RENAME TO "{table}";')
         conn.commit()
         note = f"（备份 {bak} 保留不动）" if (plain_already and redo) else f"（超表备份为 {bak}）"
