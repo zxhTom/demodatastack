@@ -6,7 +6,7 @@
 import argparse
 import random
 import sys
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 import psycopg2
 import psycopg2.extras
@@ -260,8 +260,9 @@ def mogrify_rows(conn, table, rows, batch_size):
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--start", required=True, help="开始日期 YYYY-MM-DD")
-    p.add_argument("--end",   required=True, help="结束日期 YYYY-MM-DD（含）")
+    p.add_argument("--start", help="开始日期 YYYY-MM-DD")
+    p.add_argument("--end",   help="结束日期 YYYY-MM-DD（含）")
+    p.add_argument("--days",  type=int, help="时间跨度（天），配合 --start 或 --end 使用（三者任选两个组合）")
     p.add_argument("--count", type=int, default=None,
                    help="每张表生成的总条数")
     p.add_argument("--count-per-day", type=int, default=None,
@@ -277,10 +278,33 @@ def parse_args():
     return p.parse_args()
 
 
+def resolve_range(args):
+    """--start/--end/--days 三选二即可确定范围，跟 seed_meter_data.py 的规则一致。"""
+    if args.start and args.end:
+        start = date.fromisoformat(args.start)
+        end = date.fromisoformat(args.end)
+    elif args.start and args.days:
+        start = date.fromisoformat(args.start)
+        end = start + timedelta(days=args.days - 1)
+    elif args.end and args.days:
+        end = date.fromisoformat(args.end)
+        start = end - timedelta(days=args.days - 1)
+    elif args.start:
+        start = end = date.fromisoformat(args.start)
+    elif args.end:
+        start = end = date.fromisoformat(args.end)
+    else:
+        sys.exit("必须指定 --start/--end 中至少一个（可配合 --days）")
+    if start > end:
+        sys.exit(f"开始日期 {start} 晚于结束日期 {end}")
+    return start, end
+
+
 def main():
     args = parse_args()
-    start_dt = datetime.fromisoformat(args.start)
-    end_dt   = datetime.fromisoformat(args.end) + timedelta(days=1)
+    start, end = resolve_range(args)
+    start_dt = datetime(start.year, start.month, start.day)
+    end_dt   = datetime(end.year, end.month, end.day) + timedelta(days=1)
     n_days   = (end_dt - start_dt).days
 
     if args.count is not None and args.count_per_day is not None:
@@ -302,7 +326,7 @@ def main():
     if args.dry_run:
         n_meters = len(meter_ids) if meter_ids else "?"
         print(f"tables={sorted(tables)}")
-        print(f"range={args.start}~{args.end} ({n_days}天)  count={count}/表  meters={n_meters}")
+        print(f"range={start}~{end} ({n_days}天)  count={count}/表  meters={n_meters}")
         print(f"预计总行数 = {len(tables)} x {count} = {len(tables) * count}")
         return
 
@@ -314,7 +338,7 @@ def main():
         meters = fetch_meters(conn, meter_ids)
         if not meters:
             sys.exit("没有匹配到任何 c_meter 记录")
-        print(f"meters={len(meters)}  range={args.start}~{args.end} ({n_days}天)  count={count}/表  seed={args.seed}")
+        print(f"meters={len(meters)}  range={start}~{end} ({n_days}天)  count={count}/表  seed={args.seed}")
         if sql_file:
             print(f"SQL 输出模式：语句将写入 {args.sql_out}")
 
