@@ -12,8 +12,8 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    from app.kafka.consumer import start_kafka_consumer
-    task = asyncio.create_task(start_kafka_consumer())
+    from app.streams.consumer import start_stream_consumer
+    task = asyncio.create_task(start_stream_consumer())
     logger.info("教务管理系统 API 启动完成")
     yield
     task.cancel()

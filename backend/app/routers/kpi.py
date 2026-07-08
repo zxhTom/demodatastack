@@ -67,7 +67,7 @@ async def create_kpi_event(
         metric_name=data.get("metric_name", "manual"),
         metric_value=data.get("metric_value"),
         dimension=data.get("dimension"),
-        tags=data.get("tags"),
+        tags_data=data.get("tags"),
     )
     db.add(event)
     await db.flush()

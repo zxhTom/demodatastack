@@ -33,10 +33,6 @@ done
 PORT_POSTGRES_PRIMARY=5432
 PORT_POSTGRES_REPLICA=5433
 PORT_REDIS=6380           # 避开系统默认 6379
-PORT_ZOOKEEPER=2181
-PORT_KAFKA=9092
-PORT_KAFKA_EXTERNAL=29092
-PORT_KAFKA_CONNECT=8083
 PORT_BACKEND=8000
 PORT_FRONTEND=3000
 
@@ -137,8 +133,6 @@ check_port() {
 
 check_port $PORT_POSTGRES_PRIMARY "PostgreSQL Primary"
 check_port $PORT_REDIS            "Redis"
-check_port $PORT_KAFKA            "Kafka"
-check_port $PORT_KAFKA_CONNECT    "Kafka Connect"
 check_port $PORT_BACKEND          "Backend API"
 check_port $PORT_FRONTEND         "Frontend"
 
@@ -166,7 +160,6 @@ if [[ ! -f .env ]]; then
 # 自动生成，可按需修改
 POSTGRES_PASSWORD=postgres123
 REDIS_URL=redis://redis:6379/0
-KAFKA_BOOTSTRAP_SERVERS=kafka:9092
 SECRET_KEY=$(openssl rand -hex 32 2>/dev/null || echo "edu-manage-secret-$(date +%s)")
 ACCESS_TOKEN_EXPIRE_MINUTES=1440
 EOF
@@ -175,9 +168,9 @@ fi
 # =============================================================================
 # 5. 启动基础服务
 # =============================================================================
-log_step "启动基础服务 (PostgreSQL + Zookeeper + Redis)"
+log_step "启动基础服务 (PostgreSQL + Redis)"
 
-$DC up -d postgres-primary zookeeper redis
+$DC up -d postgres-primary redis
 
 log_info "等待 PostgreSQL 健康..."
 TIMEOUT=120
@@ -236,108 +229,16 @@ fi
 log_info "数据库初始化完成"
 
 # =============================================================================
-# 7. 启动 Kafka
+# 7. 构建并启动后端 + CDC 采集器
 # =============================================================================
-log_step "启动 Kafka"
-
-$DC up -d kafka
-
-log_info "等待 Kafka 就绪..."
-TIMEOUT=120; ELAPSED=0
-until $DC exec -T kafka kafka-topics --bootstrap-server kafka:9092 --list &>/dev/null; do
-    if [[ $ELAPSED -ge $TIMEOUT ]]; then
-        log_error "Kafka 启动超时"
-        exit 1
-    fi
-    printf "."
-    sleep 3
-    ELAPSED=$((ELAPSED + 3))
-done
-echo ""
-log_info "Kafka 已就绪"
-
-# =============================================================================
-# 8. 启动 Kafka Connect
-# =============================================================================
-log_step "启动 Kafka Connect (Debezium)"
-
-$DC up -d kafka-connect
-
-log_info "等待 Kafka Connect REST API 就绪（最长 3 分钟）..."
-TIMEOUT=180; ELAPSED=0
-until curl -sf http://localhost:$PORT_KAFKA_CONNECT/connectors &>/dev/null; do
-    if [[ $ELAPSED -ge $TIMEOUT ]]; then
-        log_warn "Kafka Connect 启动超时，CDC 功能可能不可用，稍后手动注册"
-        break
-    fi
-    printf "."
-    sleep 3
-    ELAPSED=$((ELAPSED + 3))
-done
-echo ""
-
-# 注册 Debezium Connector
-if curl -sf http://localhost:$PORT_KAFKA_CONNECT/connectors &>/dev/null; then
-    log_info "注册 Debezium PostgreSQL Connector..."
-    EXISTING=$(curl -s http://localhost:$PORT_KAFKA_CONNECT/connectors/edumanage-postgres-connector 2>/dev/null | grep -c '"name"' || true)
-    if [[ "$EXISTING" -gt 0 ]]; then
-        log_info "Connector 已存在，删除后重建..."
-        curl -s -X DELETE http://localhost:$PORT_KAFKA_CONNECT/connectors/edumanage-postgres-connector &>/dev/null || true
-        sleep 3
-    fi
-
-    HTTP_STATUS=$(curl -s -o /tmp/connector_response.json -w "%{http_code}" \
-      -X POST "http://localhost:$PORT_KAFKA_CONNECT/connectors" \
-      -H "Content-Type: application/json" \
-      -d "{
-        \"name\": \"edumanage-postgres-connector\",
-        \"config\": {
-          \"connector.class\":                  \"io.debezium.connector.postgresql.PostgresConnector\",
-          \"database.hostname\":                \"postgres-primary\",
-          \"database.port\":                    \"5432\",
-          \"database.user\":                    \"postgres\",
-          \"database.password\":                \"postgres123\",
-          \"database.dbname\":                  \"edumanage\",
-          \"topic.prefix\":                     \"edumanage\",
-          \"plugin.name\":                      \"pgoutput\",
-          \"publication.name\":                 \"dbz_publication\",
-          \"slot.name\":                        \"debezium_slot\",
-          \"table.include.list\":               \"public.departments,public.teachers,public.students,public.courses,public.semesters,public.enrollments,public.grades,public.attendance,public.course_schedules\",
-          \"key.converter\":                    \"org.apache.kafka.connect.json.JsonConverter\",
-          \"key.converter.schemas.enable\":     \"true\",
-          \"value.converter\":                  \"org.apache.kafka.connect.json.JsonConverter\",
-          \"value.converter.schemas.enable\":   \"true\",
-          \"heartbeat.interval.ms\":            \"10000\",
-          \"slot.drop.on.stop\":                \"false\",
-          \"decimal.handling.mode\":            \"double\",
-          \"time.precision.mode\":              \"connect\",
-          \"include.schema.changes\":           \"true\",
-          \"snapshot.mode\":                    \"initial\",
-          \"tombstones.on.delete\":             \"false\"
-        }
-      }")
-
-    if [[ "$HTTP_STATUS" == "201" || "$HTTP_STATUS" == "200" ]]; then
-        log_info "✅ Debezium Connector 注册成功"
-    else
-        log_warn "Connector 注册返回 HTTP $HTTP_STATUS，详情: $(cat /tmp/connector_response.json)"
-    fi
-else
-    log_warn "Kafka Connect 未就绪，跳过 Connector 注册。稍后手动执行:"
-    log_warn "  bash docker/debezium/register-connector.sh"
-fi
-
-# =============================================================================
-# 9. 构建并启动后端
-# =============================================================================
-log_step "构建并启动后端 (FastAPI)"
+log_step "构建并启动后端 (FastAPI) 与 CDC 采集器 (PG逻辑复制 → Redis Stream)"
 
 if [[ "$SKIP_BUILD" == "false" ]]; then
-    log_info "构建后端镜像..."
+    log_info "构建后端镜像（backend 与 cdc-collector 共用）..."
     $DC build backend
 fi
 
-$DC up -d backend
+$DC up -d backend cdc-collector
 
 log_info "等待后端 API 就绪..."
 TIMEOUT=120; ELAPSED=0
@@ -354,7 +255,7 @@ echo ""
 log_info "后端 API 已就绪"
 
 # =============================================================================
-# 10. 构建并启动前端
+# 8. 构建并启动前端
 # =============================================================================
 log_step "构建并启动前端 (React + Nginx)"
 
@@ -379,7 +280,7 @@ done
 echo ""
 
 # =============================================================================
-# 11. 部署验证
+# 9. 部署验证
 # =============================================================================
 log_step "部署验证"
 
@@ -398,9 +299,9 @@ check() {
 
 check "PostgreSQL 连接"     "PGPASSWORD=postgres123 psql -h localhost -p $PORT_POSTGRES_PRIMARY -U postgres -d edumanage -c 'SELECT 1' -q"
 check "Redis 连接"          "redis-cli -p $PORT_REDIS ping 2>/dev/null | grep -q PONG || docker exec redis redis-cli ping 2>/dev/null | grep -q PONG"
-check "Kafka 就绪"          "$DC exec -T kafka kafka-topics --bootstrap-server kafka:9092 --list"
-check "Kafka Connect 就绪"  "curl -sf http://localhost:$PORT_KAFKA_CONNECT/connectors"
-check "Debezium Connector"  "curl -s http://localhost:$PORT_KAFKA_CONNECT/connectors/edumanage-postgres-connector/status | grep -q RUNNING"
+check "CDC 采集器运行"      "$DC ps cdc-collector | grep -qiE 'up|running'"
+check "CDC 复制槽存在"      "PGPASSWORD=postgres123 psql -h localhost -p $PORT_POSTGRES_PRIMARY -U postgres -d edumanage -tAc \"SELECT COUNT(*) FROM pg_replication_slots WHERE slot_name='redis_cdc_slot'\" | grep -q '^1$'"
+check "CDC Publication"     "PGPASSWORD=postgres123 psql -h localhost -p $PORT_POSTGRES_PRIMARY -U postgres -d edumanage -tAc \"SELECT COUNT(*) FROM pg_publication WHERE pubname='cdc_pub'\" | grep -q '^1$'"
 check "后端 /health"        "curl -sf http://localhost:$PORT_BACKEND/health"
 check "后端登录 API"        "curl -sf -X POST http://localhost:$PORT_BACKEND/api/auth/login -H 'Content-Type: application/json' -d '{\"username\":\"admin\",\"password\":\"admin123\"}' | grep -q access_token"
 check "前端首页"            "curl -sf http://localhost:$PORT_FRONTEND | grep -q 'html'"
@@ -408,7 +309,7 @@ check "数据库学生表"         "PGPASSWORD=postgres123 psql -h localhost -p 
 check "TimescaleDB hypertable" "PGPASSWORD=postgres123 psql -h localhost -p $PORT_POSTGRES_PRIMARY -U postgres -d edumanage -tAc 'SELECT COUNT(*) FROM timescaledb_information.hypertables' | grep -qE '^[2-9]'"
 
 # =============================================================================
-# 12. 汇总输出
+# 10. 汇总输出
 # =============================================================================
 echo ""
 echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════════════╗${NC}"
@@ -422,7 +323,7 @@ HOST=$(hostname -I | awk '{print $1}')
 echo -e "  🌐 前端应用    http://${HOST}:${PORT_FRONTEND}"
 echo -e "  🔌 后端 API    http://${HOST}:${PORT_BACKEND}"
 echo -e "  📖 API 文档    http://${HOST}:${PORT_BACKEND}/docs"
-echo -e "  🔗 Kafka       http://${HOST}:${PORT_KAFKA_CONNECT}"
+echo -e "  📡 CDC 事件流  docker exec redis redis-cli XLEN cdc:events"
 echo ""
 echo -e "  ${BOLD}登录账号：${NC}"
 echo -e "  👤 管理员      admin     / admin123"

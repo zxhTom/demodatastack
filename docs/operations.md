@@ -1,5 +1,9 @@
 # 教务管理系统 运维手册
 
+> ⚠️ **本手册已过时（Kafka 时代）**。2026-07 架构整改已移除 Kafka/Zookeeper/Debezium，
+> 改用 Redis Stream CDC。最新部署与运维请看 [deployment-manual.md](deployment-manual.md)，
+> 本文中所有 kafka / kafka-connect / zookeeper / Debezium 相关命令均已失效。
+
 ## 1. 快速启动
 
 ### 环境要求
