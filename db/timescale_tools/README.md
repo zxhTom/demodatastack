@@ -25,6 +25,7 @@ python3 table_convert.py seed --module curve --start 2025-01-01 --days 7   # 造
 | --- | --- |
 | `table_convert.py` | **【推荐】** 双向转换 + 造数据入口，见 §9 |
 | `tables.ini` | `table_convert.py` 用的表清单（23 张：事件10+曲线12+日志1） |
+| `find_leftover_tables.py` | 扫描历次转换留下的临时/备份表，生成待审查清理 SQL，见 §10 |
 | `db.env.example` | 数据库连接配置模板，复制成 `db.env` 改成你自己的 |
 | `dbconfig.py` | 共享的连接配置加载器 |
 | `benchmark.py` | 普通表 vs 超表 性能对比，输出 Markdown 报告（独立于转换，继续可用） |
@@ -353,12 +354,147 @@ python3 table_convert.py seed --module curve --start 2025-01-01 --days 7 --dry-r
 ### 9.5 已验证过的场景
 
 以下场景已经在本机 Postgres 上用真实建表+写数据+转换+校验跑通过（用的是模拟
-`sys_fep_comm_log` 单列主键场景的临时测试表，非生产表）：
+生产场景的临时测试表，非真实业务表；结果供你判断代码是否可信，不代表在你的
+真实数据上跑过）：
 
 - 普通表 → 超表：`pk_columns` 自动重建主键成功，行数与内容校验（`sum(device_id)`
   校验和）转换前后完全一致
 - 超表 → 普通表：完整往返（to-hyper 再 to-plain）后行数与校验和依然完全一致
 - 幂等跳过：重复执行 `to-hyper` 会正确识别"已是超表"并跳过，不会重复处理
 - `status` 命令能在转换前正确诊断出"主键不含分区列"的表，并给出具体需要加什么配置
-- `--dry-run` 现在会用真实只读连接做状态诊断（能显示会跳过还是会报错），而不是
-  盲目打印一遍固定的 SQL 模板
+- `--dry-run` 会用真实只读连接做状态诊断（能显示会跳过还是会报错），不是盲目打印
+  一遍固定的 SQL 模板
+- **serial 列的序列归属**：转换前后序列正确改挂到新表，不会因为备份表将来被删
+  而级联带走序列（这是实测中发现并修复的真实 bug——序列改挂的 SQL 曾经因为漏了
+  一次 `conn.commit()` 而在连接关闭时被静默回滚，现已修复并验证）
+- `--redo`（两个方向）：DROP 当前表前会先摘掉序列的 OWNED BY 归属，重命名完成后
+  再挂回去，序列不会被级联删除，自增值也不会跳变错乱（实测 `nextval()` 在 redo
+  前后连续无冲突）
+- **真实信号中断**：用 `kill -TERM` 在 3 张表批量转换到一半时发送信号，验证到
+  ①当前正在处理的这张表会完整跑完（不会砍在事务中间），②跑完立刻停止、不再
+  开始下一张，③退出码 130，④进度文件正确记录 `run_interrupted`，⑤重新执行
+  同样命令后正确跳过已完成的表、从断点继续，⑥全部转完后行数完全一致
+- 新增表：往 `tables.ini` 加一个新的 `[section]`，不改任何代码，`status`/
+  `to-hyper` 立刻就能识别并处理
+
+### 9.6 可以放心随时中断（Ctrl+C / kill）
+
+**第一次** Ctrl+C（或 `kill -TERM`）：不会立刻杀掉进程，而是等**当前正在处理的
+这一张表**跑完（提交或回滚）才停，绝不会砍在一张表的事务中间。终端会打印：
+
+```
+[!] 收到 SIGINT：当前这张表处理完（提交或回滚）后就停，不会停在表中间。
+再按一次 Ctrl+C 立即强制退出。
+```
+
+**第二次** Ctrl+C：立即强制退出。这也是安全的——如果当前表还没提交，进程一断开，
+PostgreSQL 会自动把这张表未提交的事务回滚掉，不会留下写了一半的数据；下次重跑，
+`to_hyper_one`/`to_plain_one` 开头都会先 `DROP TABLE IF EXISTS` 清理残留的
+`_ts_new`/`_plain_new` 临时表，不需要你手动善后。
+
+用 `kill -9`（SIGKILL，程序完全来不及反应）中断也是安全的，原理相同——只是
+不会有"等当前表跑完"的礼貌等待，直接在事务层面回滚。
+
+### 9.7 断点续传 / 完全重新跑
+
+**默认行为就是断点续传**，不需要额外加参数：脚本每次处理一张表前，都会先查
+数据库里这张表**现在实际是什么状态**，已经转换成功的表会打印 `[跳过]` 直接
+跳过，不会重复处理。所以你中断后，重新执行**一模一样的命令**就会自动跳到还
+没做完的表继续：
+
+```bash
+python3 table_convert.py to-hyper --group event -y     # 假设跑到 d_communication_event_log 时中断了
+python3 table_convert.py to-hyper --group event -y     # 重新执行同一条命令，前面已完成的自动跳过，从这张继续
+```
+
+这个"续传"不是靠一个进度文件里记的状态（那种方式容易和数据库实际状态对不上），
+而是每次都直接问数据库"你现在到底是什么状态"，所以哪怕你中途手动改过某张表、
+或者进度文件丢了，续传结果也始终和数据库的真实状态一致。
+
+**想完全重新跑**（哪怕某张表已经转换成功了，也要重新转一遍）用 `--redo`：
+
+```bash
+python3 table_convert.py to-hyper --group event --redo -y   # 从 _pg_old 备份重新迁移
+python3 table_convert.py to-plain --group event --redo -y   # 从 _ts_old 备份重新转换
+```
+
+⚠️ **`--redo` 会丢弃数据**：它是"从备份那一刻的冻结快照重新来一遍"，如果备份
+之后你又往当前表里写过新数据，这些新数据会在 redo 后消失（回到备份那一刻的
+样子）。执行前会有明确的确认提示（`-y` 也不会跳过这条警告文字，只是跳过要不要
+继续的交互确认），用之前确认清楚这真的是你要的。
+
+### 9.8 执行进度 & 后台运行
+
+**前台跑**：每张表开始时会打印 `[N/总数]` 进度：
+
+```
+──────────────────────────────────────────────────────────────
+[3/10] d_disconnector_event_log
+  [MIGRATE] ...
+```
+
+**想看结构化进度**（方便脚本/监控系统读取），加 `--progress-file`，会把每张表
+处理完的结果追加写成一行 JSON：
+
+```bash
+python3 table_convert.py to-hyper --group event -y --progress-file progress.jsonl
+tail -f progress.jsonl
+# {"event": "table_done", "idx": 3, "total": 10, "table": "d_disconnector_event_log", "result": "ok", "ts": "..."}
+# 全部跑完或被中断时还会各写一条 run_complete / run_interrupted 汇总
+```
+
+**后台运行**：用 `nohup` 丢后台，标准输出重定向到日志文件即可，不需要任何
+特殊参数（已经做了行缓冲，重定向到文件也能 `tail -f` 实时看到）：
+
+```bash
+nohup python3 table_convert.py to-hyper --group event -y \
+    --progress-file progress.jsonl > convert.log 2>&1 &
+disown          # 可选：脱离当前 shell，关终端也不会被挂掉
+
+tail -f convert.log          # 看详细执行日志
+tail -f progress.jsonl       # 看结构化进度
+```
+
+**最简单的进度检查方式**：不需要进度文件，直接另开一个终端跑 `status`——它
+直接查数据库当前状态，是最准确、最实时的进度视图：
+
+```bash
+python3 table_convert.py status --group event
+```
+
+停掉后台任务：`kill -TERM <pid>`（等当前表跑完再停，见 §9.6），或者
+`kill -9 <pid>` 立即强制停止，都是安全的。
+
+---
+
+## 10. 清理历次转换留下的临时表 / 备份表
+
+多次转换（尤其是试验、中断重跑、`--redo`）会积累不少 `_ts_new`/`_pg_old`/
+`_ts_old`/`_plain_new` 这类表。`find_leftover_tables.py` 是一个**只读扫描脚本**，
+会按命名规律找出这些表并生成一份**默认全部注释掉**的清理 SQL——不会自动删除
+任何东西，你自己看过、确认要删的表把对应行的 `--` 去掉再手动执行。
+
+```bash
+python3 find_leftover_tables.py                          # 用同目录 db.env
+python3 find_leftover_tables.py --env-file prod.env --out cleanup_candidates.sql
+```
+
+输出分四类，风险从低到高：
+
+| 类别 | 来源 | 风险 |
+| --- | --- | --- |
+| ① `_ts_new`/`_plain_new` | 转换中途失败/被中断后没清理的残留临时表 | 低——正常流程这类表建完马上被消费掉，能看到说明某次跑到一半没善后，下次重跑会自动 `DROP IF EXISTS` 重建，留着也无害 |
+| ② `_pg_old`/`_ts_old` | 转换成功后的原表改名备份 | 中——删之前自己核对一下现表的行数/关键数据 |
+| ③ `_bak_YYYYMMDD` | `transtable.py`（更早的迁移脚本）留下的整表快照备份 | 中——是某个时间点的完整快照，删前确认不再需要回溯 |
+| ④ `_ts` 结尾 | 可能是旧版 `convert_to_timescale.py`（新建对比模式）生成的并排超表，**也可能只是恰好这么命名的正常表，跟任何转换脚本都没关系** | **高，命名规律很宽泛**——务必逐条确认再删，不要整段无脑跑 |
+
+生成的 SQL 文件里，每一类都有对应说明和风险提示，且每条 `DROP TABLE IF EXISTS`
+后面都注明了约多少行、多大、对应哪张现表——方便你判断这张表现在是否还需要。
+
+> ④ 类已经实测出过一次误判：拿本仓库自带的 demodatastack 演示库（`edumanage`）
+> 测试这个扫描脚本时，它把 `system_logs_ts` 也列进了候选清单——但那张表其实是
+> `docker/postgres/init/04_timeseries.sql` 建库脚本直接建的固定超表，专门给
+> `benchmark.py` 做"普通表 vs 超表"性能对比用的，从来没经过任何转换脚本，
+> 是这个项目的核心 schema 的一部分，删了会破坏项目自带的基准测试功能。
+> 这不是针对你的 `eco_ma` 库的结论（那边根本没有这张表），只是提醒你：
+> ④ 类命中的表，务必自己确认一下这张表的真实来历，别看到 `_ts` 结尾就当备份删。
