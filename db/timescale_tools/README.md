@@ -338,16 +338,20 @@ python3 table_convert.py to-plain --tables sys_fep_comm_log -y
 # 造数据（转发给 db/meter_seed 下的现成脚本，--module 后面的参数原样透传）
 python3 table_convert.py seed --module curve --start 2025-01-01 --days 7
 python3 table_convert.py seed --module event --start 2025-01-01 --end 2025-01-31
+python3 table_convert.py seed --module log --start 2025-01-01 --days 7 --count-per-day 5000
 python3 table_convert.py seed --module curve --start 2025-01-01 --days 7 --dry-run   # 先看生成多少行
 ```
 
 `--group` 取值 `event`/`curve`/`log`/`all`（默认 `all`），`--tables` 优先于 `--group`。
 `-y`/`--yes` 跳过确认提示，用于脚本化调用；不加则每次都会先列出目标表清单要求确认。
 
-`seed` 的 `--module` 目前支持 `curve`（12 张曲线表，转发给 `seed_meter_data.py`）和
-`event`（10 张事件表，转发给 `seed_event_data.py`）；`log`（`sys_fep_comm_log`）暂时
-没有现成的造数据脚本。`--module` 之后的所有参数原样转发给对应脚本，用法与直接调用
-`seed_meter_data.py`/`seed_event_data.py` 完全一致（见 `db/meter_seed/README.md`）。
+`seed` 的 `--module` 支持 `curve`（12 张曲线表，转发给 `seed_meter_data.py`）、
+`event`（10 张事件表，转发给 `seed_event_data.py`）、`log`（`sys_fep_comm_log`，转发给
+`seed_log_data.py`，按抽样统计的真实生产分布造：Load Profile 占绝大多数且几乎全部
+因 `UNIT_OFFLINE[2]` 失败，`Heart Beat`/`Push Object List` 几乎必定成功等，具体权重
+见脚本内 `_TEMPLATES`）。`--module` 之后的所有参数原样转发给对应脚本，用法与直接调用
+`seed_meter_data.py`/`seed_event_data.py`/`seed_log_data.py` 完全一致
+（见 `db/meter_seed/README.md`）。
 **注意**：没有显式传 `--env-file` 时用的是被转发脚本自己目录下的
 `db/meter_seed/db.env`（即真实生产库配置）；如果显式传了 `--env-file`/`--sql-out`
 等相对路径，按你**当前所在目录**解析，不是按 `db/meter_seed/` 解析。

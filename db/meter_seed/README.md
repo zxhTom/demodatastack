@@ -63,3 +63,26 @@ python seed_meter_data.py --start 2025-01-01 --days 7 --sql-out seed.sql
 ## 累计电量基线
 
 `d_read_curve` / `d_read_curve_r` / `d_read_curve_v` 三张表里的累计寄存器（`*_r` 字段）在生成起始日期之前会先从库里已有的历史数据中读取最后一条记录作为基线续接，保证累计值不会从 0 重新跳变（`rebuild`/`fill` 模式都适用）。
+
+## seed_log_data.py（FEP 通信日志）
+
+为 `sys_fep_comm_log` 造数据。`comm_log_id` 由序列自动生成，不需要（也不能）指定；
+`device_id` 取自 `c_meter`/`r_mp`（跟 `seed_event_data.py` 同一套查询）。
+
+事件模板（`title`/`action_type`/`command_type`/`log_content*` 组合、各自的权重、
+失败率、失败原因池、耗时区间）取自对 `eco_ma.sys_fep_comm_log` 真实数据的抽样统计，
+不是随手编的分布——比如 `Load Profile` 在真实数据里占了九成以上，且几乎全部因为
+`UNIT_OFFLINE[2]`（设备离线）失败；`Heart Beat`/`Push Object List` 则几乎必定成功。
+想调整分布/加新模板直接改脚本里的 `_TEMPLATES` 列表。
+
+```bash
+python seed_log_data.py --start 2025-01-01 --days 7                          # 默认每天 2000 条
+python seed_log_data.py --start 2025-01-01 --days 7 --count-per-day 20000    # 调大到接近生产量级
+python seed_log_data.py --start 2025-01-01 --days 1 --dry-run                # 先看会生成多少行
+python seed_log_data.py --start 2025-01-01 --days 7 --sql-out seed_log.sql   # 只导出 SQL，不直接写库
+```
+
+参数跟 `seed_meter_data.py`/`seed_event_data.py` 是同一套风格：`--start`/`--end`/`--days`
+三选二定范围，`--count`/`--count-per-day` 二选一控制总量，`--meters`/`--batch-size`/
+`--seed`/`--env-file`/`--dry-run`/`--sql-out` 含义相同。真实生产量级约 17 万条/天，
+默认值只是给测试用的保守起点，按需用 `--count`/`--count-per-day` 调大。

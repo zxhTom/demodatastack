@@ -23,6 +23,7 @@
   python3 table_convert.py to-plain --tables d_alarm_event -y
   python3 table_convert.py seed --module curve --start 2025-01-01 --days 7
   python3 table_convert.py seed --module event --start 2025-01-01 --end 2025-01-31
+  python3 table_convert.py seed --module log --start 2025-01-01 --days 7
 
 可随时 Ctrl+C 中断（当前表处理完/回滚后才停，不会停在表中间），重新执行同样
 的命令会自动跳过已完成的表、从断点继续；想强制重做已完成的表用 --redo；
@@ -50,7 +51,7 @@ METER_SEED_DIR = os.path.normpath(os.path.join(_HERE, "..", "meter_seed"))
 SEED_MODULES = {
     "curve": "seed_meter_data.py",   # 12 张 d_load_*/d_read_curve*/d_demand_curve 曲线表
     "event": "seed_event_data.py",   # 10 张事件表
-    # log（sys_fep_comm_log）目前没有现成造数据脚本，先不注册
+    "log":   "seed_log_data.py",     # sys_fep_comm_log（FEP 通信日志）
 }
 
 
@@ -798,8 +799,7 @@ def seed_cmd(raw_args):
         sys.exit("[错误] --module 后面缺参数")
     module = raw_args[idx + 1]
     if module not in SEED_MODULES:
-        sys.exit(f"[错误] 未知 module: {module}，可选: {', '.join(SEED_MODULES)}"
-                  f"（log/sys_fep_comm_log 暂无现成造数据脚本）")
+        sys.exit(f"[错误] 未知 module: {module}，可选: {', '.join(SEED_MODULES)}")
 
     script = os.path.join(METER_SEED_DIR, SEED_MODULES[module])
     if not os.path.isfile(script):
