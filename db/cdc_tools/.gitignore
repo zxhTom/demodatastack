@@ -1,0 +1,4 @@
+# 真实连接信息只放本地，不进版本库。
+# cdc.example.ini 是模板，必须保留在版本库里，显式排除。
+*.ini
+!cdc.example.ini
