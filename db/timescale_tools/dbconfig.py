@@ -7,8 +7,13 @@
   3. 内置默认值（仅用于本地演示）
 
 这样你可以把真实连接信息只放在 db.env 里单独维护，不会进版本库。
+
+DB_PASSWORD / DB_DSN 支持 ENC(...) 密文（与 pg-cdc-agent 同一套机制）：
+用 pg-cdc-agent 的 encrypt-password 子命令生成，密钥找 CDC_CONFIG_KEY
+环境变量 / CDC_CONFIG_KEY_FILE / ~/.cdc_agent.key。
 """
 import os
+import sys
 
 # 内置默认值（与 docker-compose.yml 中的 timescaledb 一致，仅供本地演示）
 _DEFAULTS = {
@@ -38,6 +43,27 @@ def _load_env_file(path):
     return values
 
 
+def _decrypt(value):
+    if not (isinstance(value, str) and value.startswith("ENC(") and value.endswith(")")):
+        return value
+    try:
+        from cryptography.fernet import Fernet, InvalidToken
+    except ImportError:
+        sys.exit("[错误] 配置里使用了 ENC(...) 密文，但未安装 cryptography 库：pip install cryptography")
+    key = os.environ.get("CDC_CONFIG_KEY", "").strip().encode()
+    if not key:
+        key_file = os.environ.get("CDC_CONFIG_KEY_FILE", "").strip() or os.path.expanduser("~/.cdc_agent.key")
+        if not os.path.isfile(key_file):
+            sys.exit(f"[错误] 配置里使用了 ENC(...) 密文，但找不到解密密钥（{key_file}）。"
+                     f"用 pg-cdc-agent 的 encrypt-password --gen-key 生成。")
+        with open(key_file, "rb") as fh:
+            key = fh.read().strip()
+    try:
+        return Fernet(key).decrypt(value[4:-1].encode()).decode()
+    except InvalidToken:
+        sys.exit("[错误] ENC(...) 密文解密失败：密钥与密文不匹配，或密文被截断/篡改。")
+
+
 def load_config(env_file=None):
     """返回最终的配置 dict。"""
     here = os.path.dirname(os.path.abspath(__file__))
@@ -49,6 +75,8 @@ def load_config(env_file=None):
     for key in list(cfg.keys()):
         if os.environ.get(key):
             cfg[key] = os.environ[key]
+    cfg["DB_PASSWORD"] = _decrypt(cfg.get("DB_PASSWORD", ""))
+    cfg["DB_DSN"] = _decrypt(cfg.get("DB_DSN", ""))
     return cfg
 
 

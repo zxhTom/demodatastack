@@ -402,7 +402,7 @@ def _build_hypertable(conn, tmp, src, cfg, verbose):
     print(f"    ✓ 数据复制完成，{inserted:,} 行")
 
 
-def to_hyper_one(conn, table, cfg, redo, dry_run, verbose):
+def to_hyper_one(conn, table, cfg, redo, dry_run, verbose, drop_backup=False):
     """返回 'skip' | 'ok' | 'error'"""
     tmp = f"{table}_ts_new"
     bak = f"{table}_pg_old"
@@ -421,11 +421,13 @@ def to_hyper_one(conn, table, cfg, redo, dry_run, verbose):
     if not hyper and is_partitioned(conn, table):
         print(f"  [跳过]  {table}: 是 PG 原生分区表（暂不支持，需要另行处理）")
         return "skip"
-    if not hyper and table_exists(conn, bak):
+    bak_occupied = not hyper and table_exists(conn, bak)
+    if bak_occupied and not drop_backup:
         # --redo 只在"现在就是超表"时才有意义（从 _pg_old 重新迁移）；现在已经是
         # 普通表的话 --redo 不适用，会走下面的普通迁移路径，同样需要这个校验，
         # 不能因为传了 --redo 就放过（这里曾经错误地放过，实测复现过这个 bug）。
-        print(f"  [错误]  {table}: 备份名 {bak} 已被占用，请先处理（重命名或 DROP）后重试")
+        print(f"  [错误]  {table}: 备份名 {bak} 已被占用，请先处理（重命名或 DROP）后重试，"
+              f"或加 --drop-backup 让脚本自动删除旧备份后继续")
         return "error"
 
     src = bak if (hyper and redo) else table
@@ -439,7 +441,11 @@ def to_hyper_one(conn, table, cfg, redo, dry_run, verbose):
     print(f"\n  [{mode}] {table} → 超表（源: {src}，PK 处理: {pk_detail}）")
 
     if dry_run:
-        steps = [
+        steps = []
+        if bak_occupied and drop_backup:
+            steps.append(f'DROP TABLE "{bak}";  -- --drop-backup：先删除占用备份名的旧备份表'
+                         f'（该表转换前的历史快照将不再可恢复）')
+        steps += [
             f'DROP TABLE IF EXISTS "{tmp}";',
             f'CREATE TABLE "{tmp}" (LIKE "{src}" INCLUDING DEFAULTS INCLUDING GENERATED '
             f'INCLUDING STORAGE INCLUDING COMMENTS);  -- 不含索引/约束',
@@ -466,6 +472,12 @@ def to_hyper_one(conn, table, cfg, redo, dry_run, verbose):
         return "ok"
 
     try:
+        if bak_occupied and drop_backup:
+            with conn.cursor() as cur:
+                cur.execute(f'DROP TABLE "{bak}";')
+            print(f"    ⚠ 已删除旧备份 {bak}（--drop-backup），该表转换前的历史快照不再可恢复"
+                  f"（如果本次转换后面失败回滚，这个 DROP 也会一并回滚，旧备份会恢复）")
+
         strip_suffix = "_pgold" if (hyper and redo) else None
         constraints, indexes = get_index_and_constraint_defs(conn, src, strip_suffix=strip_suffix)
         _build_hypertable(conn, tmp, src, cfg, verbose)
@@ -578,7 +590,7 @@ def reown_sequences_by_default_expr(conn, table, old_table, verbose):
               f'ALTER SEQUENCE "{seq}" OWNED BY "{table}"."{col}";', verbose)
 
 
-def to_plain_one(conn, table, redo, dry_run, verbose):
+def to_plain_one(conn, table, redo, dry_run, verbose, drop_backup=False):
     """返回 'skip' | 'ok' | 'error'。conn 必须是真实连接（dry-run 也要做实时诊断）。
 
     redo=True 时，如果当前已经是普通表，会从 {table}_ts_old 备份重新转换一遍
@@ -601,8 +613,10 @@ def to_plain_one(conn, table, redo, dry_run, verbose):
     if plain_already and redo and not table_exists(conn, bak):
         print(f"  [跳过]  {table}: 当前是普通表但找不到备份 {bak}，无法 --redo")
         return "skip"
-    if not plain_already and table_exists(conn, bak):
-        print(f"  [错误]  {table}: 备份名 {bak} 已被占用，请先处理（重命名或 DROP）后重试")
+    bak_occupied = not plain_already and table_exists(conn, bak)
+    if bak_occupied and not drop_backup:
+        print(f"  [错误]  {table}: 备份名 {bak} 已被占用，请先处理（重命名或 DROP）后重试，"
+              f"或加 --drop-backup 让脚本自动删除旧备份后继续")
         return "error"
 
     src = bak if (plain_already and redo) else table
@@ -610,7 +624,11 @@ def to_plain_one(conn, table, redo, dry_run, verbose):
     print(f"\n  [{mode}] {table} → 普通表（源: {src}）")
 
     if dry_run:
-        steps = [
+        steps = []
+        if bak_occupied and drop_backup:
+            steps.append(f'DROP TABLE "{bak}";  -- --drop-backup：先删除占用备份名的旧备份表'
+                         f'（该表转换前的历史快照将不再可恢复）')
+        steps += [
             f'DROP TABLE IF EXISTS "{tmp}";',
             f'CREATE TABLE "{tmp}" (LIKE "{src}" INCLUDING DEFAULTS INCLUDING GENERATED '
             f'INCLUDING STORAGE INCLUDING COMMENTS);  -- 不含索引/约束',
@@ -630,6 +648,12 @@ def to_plain_one(conn, table, redo, dry_run, verbose):
         return "ok"
 
     try:
+        if bak_occupied and drop_backup:
+            with conn.cursor() as cur:
+                cur.execute(f'DROP TABLE "{bak}";')
+            print(f"    ⚠ 已删除旧备份 {bak}（--drop-backup），该表转换前的历史快照不再可恢复"
+                  f"（如果本次转换后面失败回滚，这个 DROP 也会一并回滚，旧备份会恢复）")
+
         strip_suffix = "_tsold" if (plain_already and redo) else None
         constraints, indexes = get_index_and_constraint_defs(conn, src, strip_suffix=strip_suffix)
         _exec(conn, "清理残留临时表", f'DROP TABLE IF EXISTS "{tmp}";', verbose)
@@ -738,7 +762,7 @@ def to_hyper_cmd(dsn, targets, args):
         conn = psycopg2.connect(dsn)
         conn.autocommit = True  # 只读诊断，避免单张表查询出错拖垮后面表的事务
         for table, cfg in sorted(targets.items()):
-            to_hyper_one(conn, table, cfg, args.redo, True, False)
+            to_hyper_one(conn, table, cfg, args.redo, True, False, args.drop_backup)
         conn.close()
         print("\n[dry-run] 以上为将要执行的操作（已用真实连接做状态诊断），未对数据库做任何修改。")
         return
@@ -746,13 +770,16 @@ def to_hyper_cmd(dsn, targets, args):
     if not args.yes:
         note = ("\n⚠️  --redo 会丢弃当前超表里、上次迁移之后新写入的数据，只保留 _pg_old "
                  "备份那一刻的快照，确认这是你想要的再继续" if args.redo else "")
+        if args.drop_backup:
+            note += ("\n⚠️  --drop-backup 会在备份名 _pg_old 被占用时直接 DROP 掉旧备份，"
+                     "该表转换前的历史快照将不再可恢复，确认这是你想要的再继续")
         _confirm(targets.keys(), "转为超表" if not args.redo else "从 _pg_old 备份重新迁移（REDO）", note)
 
     items = sorted(targets.items())
 
     def _one(conn, item):
         table, cfg = item
-        return to_hyper_one(conn, table, cfg, args.redo, False, args.verbose)
+        return to_hyper_one(conn, table, cfg, args.redo, False, args.verbose, args.drop_backup)
 
     ok, skip, error, interrupted = _run_batch(dsn, items, _one, args.progress_file)
     print(f"\n完成: 转换 {ok} 张，跳过 {skip} 张，失败 {error} 张"
@@ -765,7 +792,7 @@ def to_plain_cmd(dsn, targets, args):
         conn = psycopg2.connect(dsn)
         conn.autocommit = True
         for table in sorted(targets):
-            to_plain_one(conn, table, args.redo, True, False)
+            to_plain_one(conn, table, args.redo, True, False, args.drop_backup)
         conn.close()
         print("\n[dry-run] 以上为将要执行的操作（已用真实连接做状态诊断），未对数据库做任何修改。")
         return
@@ -773,12 +800,15 @@ def to_plain_cmd(dsn, targets, args):
     if not args.yes:
         note = ("\n⚠️  --redo 会丢弃当前普通表里、上次转换之后新写入的数据，只保留 _ts_old "
                  "备份那一刻的快照，确认这是你想要的再继续" if args.redo else "")
+        if args.drop_backup:
+            note += ("\n⚠️  --drop-backup 会在备份名 _ts_old 被占用时直接 DROP 掉旧备份，"
+                     "该表转换前的历史快照将不再可恢复，确认这是你想要的再继续")
         _confirm(targets.keys(), "转回普通表" if not args.redo else "从 _ts_old 备份重新转换（REDO）", note)
 
     items = sorted(targets)
 
     def _one(conn, item):
-        return to_plain_one(conn, item, args.redo, False, args.verbose)
+        return to_plain_one(conn, item, args.redo, False, args.verbose, args.drop_backup)
 
     ok, skip, error, interrupted = _run_batch(dsn, items, _one, args.progress_file)
     print(f"\n完成: 转换 {ok} 张，跳过 {skip} 张，失败 {error} 张"
@@ -843,12 +873,18 @@ def build_parser():
     add_filters(sp)
     sp.add_argument("--redo", action="store_true",
                     help="已是超表的表，从 _pg_old 备份重新迁移（完全重新跑，会丢弃上次迁移后的新数据）")
+    sp.add_argument("--drop-backup", action="store_true",
+                    help="转换前如果备份名 _pg_old 已被之前的转换占用，直接 DROP 掉旧备份再继续"
+                         "（默认遇到占用会报错停止，要求手动处理；旧备份删除后不可恢复）")
     add_run_options(sp)
 
     sp = sub.add_parser("to-plain", help="超表 -> 普通表")
     add_filters(sp)
     sp.add_argument("--redo", action="store_true",
                     help="已是普通表的表，从 _ts_old 备份重新转换（完全重新跑，会丢弃上次转换后的新数据）")
+    sp.add_argument("--drop-backup", action="store_true",
+                    help="转换前如果备份名 _ts_old 已被之前的转换占用，直接 DROP 掉旧备份再继续"
+                         "（默认遇到占用会报错停止，要求手动处理；旧备份删除后不可恢复）")
     add_run_options(sp)
 
     sub.add_parser("seed", help=f"造数据，转发给 db/meter_seed（--module {{{'/'.join(SEED_MODULES)}}} ...）")
