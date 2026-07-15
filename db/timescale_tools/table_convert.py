@@ -383,23 +383,32 @@ def _build_hypertable(conn, tmp, src, cfg, verbose):
           # 会多出一个原表没有的索引，破坏"索引集合和原表完全一致"的保证。
           f"create_default_indexes => false);", verbose)
 
-    if cfg["segmentby"]:
-        orderby = cfg["orderby"] or f"{time_col} DESC"
-        _exec(conn, f"开启列存压缩（segmentby={cfg['segmentby']}）",
-              f'ALTER TABLE "{tmp}" SET ('
-              f"timescaledb.compress, "
-              f"timescaledb.compress_segmentby = '{cfg['segmentby']}', "
-              f"timescaledb.compress_orderby = '{orderby}');", verbose)
-        if cfg["compress_after"]:
-            _exec(conn, f"添加自动压缩策略（{cfg['compress_after']} 后压缩）",
-                  f"SELECT add_compression_policy('public.{tmp}', "
-                  f"INTERVAL '{cfg['compress_after']}', if_not_exists => true);", verbose)
-
+    # 注意：压缩必须【最后】开（见 _enable_compression）。这里只建超表 + 灌数据。
+    # 一旦开了压缩，老版本 TimescaleDB（PG11 等）就禁止再 ADD CONSTRAINT / CREATE INDEX，
+    # 报 "operation not supported on hypertables that have compression enabled"。
     print(f"    复制数据 {src} → {tmp}（全量，可能较慢）…", flush=True)
     with conn.cursor() as cur:
         cur.execute(f'INSERT INTO "{tmp}" SELECT * FROM "{src}";')
         inserted = cur.rowcount
     print(f"    ✓ 数据复制完成，{inserted:,} 行")
+
+
+def _enable_compression(conn, tmp, cfg, verbose):
+    """开启列存压缩 + 自动压缩策略。必须在【索引/约束都重建完之后】调用——
+    压缩一旦开启，老版本 TimescaleDB 不允许再对超表做 ADD CONSTRAINT / CREATE INDEX。"""
+    if not cfg["segmentby"]:
+        return
+    time_col = cfg["time_column"]
+    orderby = cfg["orderby"] or f"{time_col} DESC"
+    _exec(conn, f"开启列存压缩（segmentby={cfg['segmentby']}）",
+          f'ALTER TABLE "{tmp}" SET ('
+          f"timescaledb.compress, "
+          f"timescaledb.compress_segmentby = '{cfg['segmentby']}', "
+          f"timescaledb.compress_orderby = '{orderby}');", verbose)
+    if cfg["compress_after"]:
+        _exec(conn, f"添加自动压缩策略（{cfg['compress_after']} 后压缩）",
+              f"SELECT add_compression_policy('public.{tmp}', "
+              f"INTERVAL '{cfg['compress_after']}', if_not_exists => true);", verbose)
 
 
 def to_hyper_one(conn, table, cfg, redo, dry_run, verbose, drop_backup=False):
@@ -451,22 +460,25 @@ def to_hyper_one(conn, table, cfg, redo, dry_run, verbose, drop_backup=False):
             f'INCLUDING STORAGE INCLUDING COMMENTS);  -- 不含索引/约束',
             f"SELECT create_hypertable('public.{tmp}', by_range('{cfg['time_column']}', "
             f"INTERVAL '{cfg['chunk_interval']}'), ...);",
-        ]
-        if cfg["segmentby"]:
-            steps += ['ALTER TABLE ... SET (timescaledb.compress, ...);',
-                      f"SELECT add_compression_policy(..., INTERVAL '{cfg['compress_after']}', ...);"]
-        steps += [
             f'INSERT INTO "{tmp}" SELECT * FROM "{src}";',
             '-- 行数校验：count(src) == count(tmp)，不一致则中止',
         ]
+        # 压缩必须放在索引/约束重建【之后】，否则老版本 TimescaleDB 会报
+        # "operation not supported on hypertables that have compression enabled"
+        compress_step = []
+        if cfg["segmentby"]:
+            compress_step = ['ALTER TABLE ... SET (timescaledb.compress, ...);  -- 索引重建后才开压缩',
+                             f"SELECT add_compression_policy(..., INTERVAL '{cfg['compress_after']}', ...);"]
         if hyper and redo:
             steps += [f'DROP TABLE "{table}";  -- 删除当前（错误的）超表',
                       '-- 按原名重建索引/约束（PK 用 pk_columns 重建，其余照抄原定义）',
+                      *compress_step,
                       f'ALTER TABLE "{tmp}" RENAME TO "{table}";']
         else:
             steps += [f'ALTER TABLE "{table}" RENAME TO "{bak}";',
                       '-- 备份表上的索引/约束改名让路（原名腾给新表）',
                       '-- 按原名重建索引/约束（PK 用 pk_columns 重建，其余照抄原定义）',
+                      *compress_step,
                       f'ALTER TABLE "{tmp}" RENAME TO "{table}";']
         _print_dry_steps(steps)
         return "ok"
@@ -498,6 +510,7 @@ def to_hyper_one(conn, table, cfg, redo, dry_run, verbose, drop_backup=False):
                 cur.execute(f'DROP TABLE "{table}";')
             apply_indexes_and_constraints(conn, tmp, constraints, indexes, verbose,
                                           pk_columns=cfg["pk_columns"], time_column=cfg["time_column"])
+            _enable_compression(conn, tmp, cfg, verbose)   # 索引/约束重建完再开压缩
             with conn.cursor() as cur:
                 cur.execute(f'ALTER TABLE "{tmp}" RENAME TO "{table}";')
         else:
@@ -506,6 +519,7 @@ def to_hyper_one(conn, table, cfg, redo, dry_run, verbose, drop_backup=False):
             rename_away_conflicting(conn, bak, constraints, indexes, verbose, tag="pgold")
             apply_indexes_and_constraints(conn, tmp, constraints, indexes, verbose,
                                           pk_columns=cfg["pk_columns"], time_column=cfg["time_column"])
+            _enable_compression(conn, tmp, cfg, verbose)   # 索引/约束重建完再开压缩
             with conn.cursor() as cur:
                 cur.execute(f'ALTER TABLE "{tmp}" RENAME TO "{table}";')
         conn.commit()
