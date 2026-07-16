@@ -67,6 +67,7 @@ def parse_tables(path):
         if "time_column" not in sec:
             sys.exit(f"[错误] 表 [{section}] 缺少必填字段 time_column")
         pk_raw = sec.get("pk_columns", "").strip()
+        drop_raw = sec.get("drop_indexes", "").strip()
         tables[section] = {
             "group":          sec.get("group", "other").strip(),
             "time_column":    sec.get("time_column").strip(),
@@ -75,6 +76,10 @@ def parse_tables(path):
             "orderby":        sec.get("orderby", "").strip(),
             "compress_after": sec.get("compress_after", "").strip(),
             "pk_columns":     [c.strip() for c in pk_raw.split(",") if c.strip()],
+            # 转成超表时【不重建】的索引名（逗号分隔）。用于处理"独立唯一索引缺分区列"
+            # 这种超表建不了的场景——通常是和主键重复的冗余唯一索引，删掉不损失约束。
+            # 原表作为 _pg_old 备份仍保留这些索引，不会真的丢。
+            "drop_indexes":   [c.strip() for c in drop_raw.split(",") if c.strip()],
         }
     if not tables:
         sys.exit(f"[错误] 配置文件里没有任何表: {path}")
@@ -463,6 +468,9 @@ def to_hyper_one(conn, table, cfg, redo, dry_run, verbose, drop_backup=False):
             f'INSERT INTO "{tmp}" SELECT * FROM "{src}";',
             '-- 行数校验：count(src) == count(tmp)，不一致则中止',
         ]
+        rebuild_note = "-- 按原名重建索引/约束（PK 用 pk_columns 重建，其余照抄原定义）"
+        if cfg["drop_indexes"]:
+            rebuild_note += f"；drop_indexes 不重建: {', '.join(cfg['drop_indexes'])}"
         # 压缩必须放在索引/约束重建【之后】，否则老版本 TimescaleDB 会报
         # "operation not supported on hypertables that have compression enabled"
         compress_step = []
@@ -471,13 +479,13 @@ def to_hyper_one(conn, table, cfg, redo, dry_run, verbose, drop_backup=False):
                              f"SELECT add_compression_policy(..., INTERVAL '{cfg['compress_after']}', ...);"]
         if hyper and redo:
             steps += [f'DROP TABLE "{table}";  -- 删除当前（错误的）超表',
-                      '-- 按原名重建索引/约束（PK 用 pk_columns 重建，其余照抄原定义）',
+                      rebuild_note,
                       *compress_step,
                       f'ALTER TABLE "{tmp}" RENAME TO "{table}";']
         else:
             steps += [f'ALTER TABLE "{table}" RENAME TO "{bak}";',
                       '-- 备份表上的索引/约束改名让路（原名腾给新表）',
-                      '-- 按原名重建索引/约束（PK 用 pk_columns 重建，其余照抄原定义）',
+                      rebuild_note,
                       *compress_step,
                       f'ALTER TABLE "{tmp}" RENAME TO "{table}";']
         _print_dry_steps(steps)
@@ -492,6 +500,19 @@ def to_hyper_one(conn, table, cfg, redo, dry_run, verbose, drop_backup=False):
 
         strip_suffix = "_pgold" if (hyper and redo) else None
         constraints, indexes = get_index_and_constraint_defs(conn, src, strip_suffix=strip_suffix)
+        # drop_indexes：转换后不重建这些索引（此时名字已还原为原名，redo 也适用）。
+        # 用于"独立唯一索引缺分区列"导致超表建不了的表（如 d_alarm_event 的冗余唯一索引）。
+        drop_set = set(cfg["drop_indexes"])
+        if drop_set:
+            kept = [(n, d) for n, d in indexes if n not in drop_set]
+            dropped = [n for n, _ in indexes if n in drop_set]
+            missing = drop_set - {n for n, _ in indexes}
+            if dropped:
+                print(f"    · drop_indexes：转换后不重建 {', '.join(dropped)}"
+                      f"（原表备份 {bak} 仍保留，未真正删除）")
+            if missing:
+                print(f"    ⚠ drop_indexes 里这些名字在 {src} 上不存在，已忽略: {', '.join(sorted(missing))}")
+            indexes = kept
         _build_hypertable(conn, tmp, src, cfg, verbose)
 
         src_n = count_rows(conn, src)
@@ -535,7 +556,15 @@ def to_hyper_one(conn, table, cfg, redo, dry_run, verbose, drop_backup=False):
         return "ok"
     except psycopg2.Error as e:
         conn.rollback()
-        print(f"  [错误]  {table}: {str(e).strip()}")
+        msg = str(e).strip()
+        print(f"  [错误]  {table}: {msg}")
+        # 唯一索引缺分区列：给出可操作的指引（pk_columns 只管主键，独立唯一索引要用 drop_indexes）
+        if "unique index" in msg and cfg["time_column"] in msg:
+            print(f"          原因：{table} 上有唯一索引/约束不含分区列 {cfg['time_column']}，"
+                  f"超表要求唯一约束必须包含分区列。")
+            print(f"          · 若是主键：在 tables.ini 配 pk_columns（含 {cfg['time_column']}）")
+            print(f"          · 若是独立唯一索引（常见是和主键重复的冗余索引）：配 "
+                  f"drop_indexes = 索引名（转换后不重建它，原表备份仍保留）")
         print(f"          原表未改动；临时表 {tmp} 如残留可手动 DROP 后重试")
         return "error"
 

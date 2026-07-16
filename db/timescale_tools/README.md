@@ -316,6 +316,30 @@ pk_columns  = comm_log_id, start_time
 复合主键，转回普通表会原样保留（不会恢复成最初的单列主键，但主键名字不变、
 业务上依然是唯一约束，不影响使用）。
 
+#### 独立唯一索引缺分区列——`drop_indexes`（d_alarm_event 的坑）
+
+`pk_columns` 只管**主键**。TimescaleDB 的要求是**每一个唯一索引/约束**都要含分区列，
+所以如果表上还有**独立的唯一索引**不含分区列，即使配了 `pk_columns` 也会报：
+
+```
+cannot create a unique index without the column "alarm_time" (used in partitioning)
+```
+
+`d_alarm_event` 就是这样：主键 `pk_d_alarm_event(content_id)` 之外，还有个独立唯一索引
+`idx_pk_d_alarm_event(content_id)`——它和主键列完全一样，是**冗余重复**的（主键已保证
+`content_id` 唯一）。这种索引没法带进超表，用 `drop_indexes` 让转换时**不重建它**：
+
+```ini
+[d_alarm_event]
+time_column  = alarm_time
+pk_columns   = content_id, alarm_time    # 主键补上分区列
+drop_indexes = idx_pk_d_alarm_event      # 冗余唯一索引，转换后不重建（原表备份 _pg_old 仍保留）
+```
+
+`drop_indexes` 只是"转换后不重建"，原表作为 `_pg_old` 备份仍带着这些索引，不会真丢。
+多个索引用逗号分隔。转换报这个错时脚本会打印明确指引，告诉你该配 `pk_columns` 还是
+`drop_indexes`。（全库扫描确认过：23 张目标表里只有 `d_alarm_event` 有这个问题。）
+
 ### 9.4 常用命令
 
 ```bash
