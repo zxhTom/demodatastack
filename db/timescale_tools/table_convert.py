@@ -889,6 +889,203 @@ def seed_cmd(raw_args):
     sys.exit(r.returncode)
 
 
+# ── decompress 子命令：解压最近 N 天窗口内的 chunk（无视是否有数据）─────────────
+
+def _qchunk(sch, name):
+    return '"{}"."{}"'.format(sch.replace('"', '""'), name.replace('"', '""'))
+
+
+def _recent_chunks(conn, table, days):
+    """返回 range_end 落在 [now-days, ∞) 的 chunk 列表：(schema, name, is_compressed)。"""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT chunk_schema, chunk_name, is_compressed
+            FROM timescaledb_information.chunks
+            WHERE hypertable_name = %s
+              AND range_end > now() - make_interval(days => %s)
+            ORDER BY range_start
+            """,
+            (table, days),
+        )
+        return cur.fetchall()
+
+
+def _compress_after_days(conn, table):
+    """该表压缩策略的 compress_after（天）；没有策略返回 None，非天单位返回原字符串。"""
+    with conn.cursor() as cur:
+        try:
+            cur.execute(
+                "SELECT (config->>'compress_after') FROM timescaledb_information.jobs "
+                "WHERE proc_name='policy_compression' AND hypertable_name=%s", (table,),
+            )
+            row = cur.fetchone()
+        except psycopg2.Error:
+            conn.rollback()
+            return None
+    if not row or not row[0]:
+        return None
+    raw = row[0].strip()
+    m = re.match(r"^(\d+)\s*days?$", raw)
+    return int(m.group(1)) if m else raw
+
+
+def decompress_one(conn, table, days, dry_run, verbose):
+    if not is_hypertable(conn, table):
+        print("  非超表，跳过。")
+        return "skip"
+    chunks = _recent_chunks(conn, table, days)
+    compressed = [c for c in chunks if c[2]]
+    print(f"  最近 {days} 天窗口内 {len(chunks)} 个 chunk，其中已压缩 {len(compressed)} 个"
+          f"（另有 {len(chunks) - len(compressed)} 个本就未压缩）")
+
+    ca = _compress_after_days(conn, table)
+    if isinstance(ca, int) and ca < days:
+        print(f"  ⚠️ 该表压缩策略 compress_after={ca} 天 < {days} 天：策略会把 {ca}~{days} 天前的 "
+              f"chunk 再次压回去。要让最近 {days} 天保持解压，请先把策略改成 ≥{days} 天。")
+
+    if dry_run:
+        if verbose:
+            for sch, name, comp in chunks:
+                print(f"    {'[压缩]' if comp else '[未压]'} {name}")
+        print(f"  [dry-run] 将解压 {len(compressed)} 个 chunk（未执行）。")
+        return "ok"
+
+    if not compressed:
+        print("  无需解压。")
+        return "skip"
+
+    done = 0
+    with conn.cursor() as cur:
+        for sch, name, _comp in compressed:
+            if _stop["requested"]:
+                print("  [!] 收到停止信号，停止解压剩余 chunk。")
+                break
+            cur.execute("SELECT decompress_chunk(%s::regclass, true)", (_qchunk(sch, name),))
+            conn.commit()
+            done += 1
+            if verbose:
+                print(f"    解压 {name}")
+    print(f"  ✓ 已解压 {done}/{len(compressed)} 个 chunk。")
+    return "ok"
+
+
+def decompress_cmd(dsn, targets, args):
+    days = args.days
+    if days <= 0:
+        sys.exit("[错误] --days 必须是正整数")
+
+    if args.dry_run:
+        conn = psycopg2.connect(dsn)
+        conn.autocommit = True
+        for table in sorted(targets):
+            print(f"\n{'─' * 70}\n{table}")
+            decompress_one(conn, table, days, True, args.verbose)
+        conn.close()
+        print("\n[dry-run] 以上为将要解压的 chunk，未对数据库做任何修改。")
+        return
+
+    if not args.yes:
+        _confirm(targets.keys(), f"解压最近 {days} 天窗口内的 chunk",
+                 "\n（无视有无数据，只要 chunk 落在窗口内且已压缩就解压；解压会临时占用更多磁盘）")
+
+    items = sorted(targets)
+
+    def _one(conn, item):
+        return decompress_one(conn, item, days, False, args.verbose)
+
+    ok, skip, error, interrupted = _run_batch(dsn, items, _one, args.progress_file)
+    print(f"\n完成: 处理 {ok} 张，跳过 {skip} 张，失败 {error} 张"
+          + ("（已中断，未处理的下次重跑会自动继续）" if interrupted else ""))
+    sys.exit(1 if error else (130 if interrupted else 0))
+
+
+# ── compress-policy 子命令：改超表的压缩策略 compress_after ────────────────────
+
+def _current_compress_after(cur, table):
+    cur.execute("SELECT config->>'compress_after' FROM timescaledb_information.jobs "
+                "WHERE proc_name='policy_compression' AND hypertable_name=%s", (table,))
+    r = cur.fetchone()
+    return r[0] if r and r[0] else None
+
+
+def compress_policy_one(conn, table, cfg, override, dry_run, verbose):
+    if not is_hypertable(conn, table):
+        print("  非超表，跳过。")
+        return "skip"
+    target = (override or cfg.get("compress_after") or "").strip()
+    if not target:
+        print("  未给 --compress-after、tables.ini 里也没配 compress_after，跳过。")
+        return "skip"
+    cur = conn.cursor()
+    current = _current_compress_after(cur, table)
+    same = False
+    if current:
+        try:
+            cur.execute("SELECT %s::interval = %s::interval", (current, target))
+            same = cur.fetchone()[0]
+        except psycopg2.Error:
+            conn.rollback()
+            same = (current == target)
+    print(f"  当前 compress_after = {current or '(无压缩策略)'}  →  目标 = {target}")
+    if same:
+        print("  已一致，跳过。")
+        return "skip"
+    if dry_run:
+        print(f"  [dry-run] 将执行: remove_compression_policy + "
+              f"add_compression_policy('{table}', INTERVAL '{target}')")
+        return "ok"
+    if compression_enabled(conn, table) is False:
+        print("  ⚠️ 该表未启用压缩（没 SET timescaledb.compress），加不了压缩策略，跳过。"
+              "先用 to-hyper 配好压缩，或手动 ALTER TABLE ... SET (timescaledb.compress...)。")
+        return "skip"
+    try:
+        cur.execute("SELECT remove_compression_policy(%s, if_exists => true)", (table,))
+        cur.execute("SELECT add_compression_policy(%s, %s::interval)", (table, target))
+        conn.commit()
+        print(f"  ✓ 压缩策略已改为 {target}")
+        return "ok"
+    except psycopg2.Error as e:
+        conn.rollback()
+        print(f"  ✗ 失败: {str(e).splitlines()[0]}")
+        return "error"
+
+
+def compress_policy_cmd(dsn, targets, args):
+    override = args.compress_after
+    if args.dry_run:
+        conn = psycopg2.connect(dsn)
+        conn.autocommit = True
+        for table, cfg in sorted(targets.items()):
+            print(f"\n{'─' * 70}\n{table}")
+            compress_policy_one(conn, table, cfg, override, True, args.verbose)
+        conn.close()
+        print("\n[dry-run] 未修改任何压缩策略。")
+        print("提示：改大 compress_after 只改【以后自动压缩】的阈值，不会解压已经压缩的旧 chunk；"
+              "要让最近 N 天的已压数据变回未压，配合 `decompress --days N`。")
+        return
+
+    if not args.yes:
+        tgt = override or "各表 tables.ini 里的 compress_after"
+        _confirm(targets.keys(), f"修改压缩策略 compress_after → {tgt}",
+                 "\n（只改自动压缩的时间阈值，不会压缩/解压任何已有 chunk）")
+
+    items = sorted(targets.items())
+
+    def _one(conn, item):
+        table, cfg = item
+        return compress_policy_one(conn, table, cfg, override, False, args.verbose)
+
+    ok, skip, error, interrupted = _run_batch(dsn, items, _one, args.progress_file)
+    print(f"\n完成: 修改 {ok} 张，跳过 {skip} 张，失败 {error} 张"
+          + ("（已中断，未处理的下次重跑会自动继续）" if interrupted else ""))
+    if override:
+        print(f"提示：别忘了把 tables.ini 里对应表的 compress_after 也改成 {override}，保持配置与库一致。")
+    print("提示：这只改了自动压缩阈值。要解压最近 N 天已压缩的数据，用 "
+          "`decompress --group ... --days N`。")
+    sys.exit(1 if error else (130 if interrupted else 0))
+
+
 # ── main ─────────────────────────────────────────────────────────────────────
 
 def build_parser():
@@ -930,6 +1127,18 @@ def build_parser():
                          "（默认遇到占用会报错停止，要求手动处理；旧备份删除后不可恢复）")
     add_run_options(sp)
 
+    sp = sub.add_parser("decompress", help="解压最近 N 天窗口内的 chunk（无视有无数据）")
+    add_filters(sp)
+    sp.add_argument("--days", type=int, required=True,
+                    help="从此刻往前 N 天，落在这个窗口内且已压缩的 chunk 全部解压")
+    add_run_options(sp)
+
+    sp = sub.add_parser("compress-policy", help="改超表压缩策略 compress_after（只改阈值，不压缩/解压已有数据）")
+    add_filters(sp)
+    sp.add_argument("--compress-after",
+                    help="新的 compress_after，如 '180 days'；不填则用各表 tables.ini 里的 compress_after")
+    add_run_options(sp)
+
     sub.add_parser("seed", help=f"造数据，转发给 db/meter_seed（--module {{{'/'.join(SEED_MODULES)}}} ...）")
 
     return p
@@ -957,6 +1166,10 @@ def main():
         to_hyper_cmd(dsn, targets, args)
     elif args.command == "to-plain":
         to_plain_cmd(dsn, targets, args)
+    elif args.command == "decompress":
+        decompress_cmd(dsn, targets, args)
+    elif args.command == "compress-policy":
+        compress_policy_cmd(dsn, targets, args)
 
 
 if __name__ == "__main__":

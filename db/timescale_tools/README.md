@@ -360,6 +360,11 @@ python3 table_convert.py to-plain --dry-run
 python3 table_convert.py to-plain --group curve -y
 python3 table_convert.py to-plain --tables sys_fep_comm_log -y
 
+# 解压最近 N 天窗口内的 chunk（无视有无数据，只要落在窗口内且已压缩就解压，见 §9.9）
+python3 table_convert.py decompress --group curve --days 90 --dry-run   # 先看会解压哪些
+python3 table_convert.py decompress --group curve --days 90 -y           # 执行
+python3 table_convert.py decompress --tables d_read_curve_v --days 90 -y
+
 # 造数据（转发给 db/meter_seed 下的现成脚本，--module 后面的参数原样透传）
 python3 table_convert.py seed --module curve --start 2025-01-01 --days 7
 python3 table_convert.py seed --module event --start 2025-01-01 --end 2025-01-31
@@ -522,6 +527,48 @@ python3 table_convert.py status --group event
 
 停掉后台任务：`kill -TERM <pid>`（等当前表跑完再停，见 §9.6），或者
 `kill -9 <pid>` 立即强制停止，都是安全的。
+
+---
+
+### 9.10 解压最近 N 天的数据——`decompress`
+
+把「从此刻往前 N 天」这个时间窗口内、当前**已压缩**的 chunk 全部解压，让最近
+N 天的数据保持未压缩（贴近生产：近期热数据不压、老数据才压）。**只看 chunk 的
+时间范围，不管里面有没有数据**——只要 chunk 落在窗口内且已压缩就解压。
+
+```bash
+# 先 dry-run 看每张表窗口内有多少 chunk、多少已压缩（不改库）
+python3 table_convert.py decompress --group curve --days 90 --dry-run
+python3 table_convert.py decompress --group curve --days 90 --dry-run -v   # -v 逐块列出
+
+# 执行（-y 跳过确认）
+python3 table_convert.py decompress --group curve --days 90 -y
+python3 table_convert.py decompress --tables d_read_curve_v,d_load_status --days 90 -y
+```
+
+- `--days N`：窗口大小，必填。选中条件是 chunk 的 `range_end > now() - N 天`。
+- `--group`/`--tables`：和其它子命令一致，选哪些表。
+- 逐块提交、可随时 Ctrl+C（等当前块解压完再停，见 §9.6）；重跑幂等——已解压的
+  块会被识别为「本就未压缩」而跳过。
+- 只解压、不改压缩策略。
+
+**先改策略、再解压（顺序很重要）**：压缩策略只会「压缩」、从不「解压」。如果某表的
+`compress_after` 比你的 `--days` 小（比如策略 30 天、你要解压最近 90 天），策略会把
+`30~90 天前`的 chunk **再次压回去**。所以要让最近 N 天稳定保持解压，先把策略改成
+`≥N 天`，再跑 `decompress`。命令检测到这种不一致时会打印 ⚠️ 警告。改策略示例：
+
+```sql
+-- 把某表压缩策略从 30 天改成 90 天（remove + add；对 12 张曲线表循环即可）
+SELECT remove_compression_policy('d_read_curve_v');
+SELECT add_compression_policy('d_read_curve_v', INTERVAL '90 days');
+```
+
+改完记得把 `tables.ini` 里对应表的 `compress_after` 也同步成 `90 days`，保持配置与库一致。
+
+**注意窗口是相对「此刻」算的，不是相对数据最新时间**：如果你的数据整体偏老（例如都在
+一年前），最近 N 天窗口里可能几乎没有真实数据，这条命令解压出来的量就很小——属于
+预期行为。要解压某个具体历史时段的数据，改用按时间范围的 `show_chunks(..., newer_than,
+older_than) + decompress_chunk`，只解压你要用的那一小段，别对亿级老数据全表解压。
 
 ---
 
